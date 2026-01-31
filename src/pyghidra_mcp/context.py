@@ -243,7 +243,11 @@ class PyGhidraContext:
                 return False
 
     def import_binary(
-        self, binary_path: str | Path, analyze: bool = False, relative_path: Path | None = None
+        self,
+        binary_path: str | Path,
+        analyze: bool = False,
+        relative_path: Path | None = None,
+        language: str | None = None,
     ) -> None:
         """
         Imports a single binary into the project.
@@ -252,6 +256,8 @@ class PyGhidraContext:
             binary_path: Path to the binary file.
             analyze: Perform analysis on this binary. Useful if not importing in bulk.
             relative_path: Relative path within the project hierarchy (Path("bin") or Path("lib")).
+            language: Optional Ghidra language ID (e.g., "PowerPC:BE:64:Xenon" for Xbox 360).
+                      If None, Ghidra auto-detects the language from the binary format.
 
         Returns:
             None
@@ -261,6 +267,10 @@ class PyGhidraContext:
         binary_path = Path(binary_path)
         if binary_path.is_dir():
             return self.import_binaries([binary_path], analyze=analyze)
+
+        # Auto-detect language if not specified
+        if language is None:
+            language = self.detect_language_for_binary(binary_path)
 
         program_name = PyGhidraContext._gen_unique_bin_name(binary_path)
 
@@ -281,7 +291,17 @@ class PyGhidraContext:
             program_info = self.programs[full_path]
         else:
             logger.info(f"Importing new program: {program_name}")
-            program = self.project.importProgram(binary_path)
+            if language:
+                logger.info(f"Using language: {language}")
+                from ghidra.program.model.lang import LanguageID
+                from ghidra.program.util import DefaultLanguageService
+
+                lang_service = DefaultLanguageService.getLanguageService()
+                lang = lang_service.getLanguage(LanguageID(language))
+                compiler_spec = lang.getDefaultCompilerSpec()
+                program = self.project.importProgram(binary_path, lang, compiler_spec)
+            else:
+                program = self.project.importProgram(binary_path)
             program.name = program_name
             if program:
                 self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
@@ -366,7 +386,7 @@ class PyGhidraContext:
     def _is_binary_file(path: Path) -> bool:
         """
         Quick header-based check for common binary formats.
-        Recognizes ELF (0x7f 'ELF') and PE ('MZ' DOS header) signatures.
+        Recognizes ELF (0x7f 'ELF'), PE ('MZ' DOS header), and XEX ('XEX2') signatures.
         Returns False on read errors or unknown signatures.
         """
         try:
@@ -380,10 +400,31 @@ class PyGhidraContext:
                 # PE executables typically start with 'MZ' (DOS stub)
                 if header.startswith(b"MZ"):
                     return True
+                # XEX: 'XEX2' (Xbox 360 executables)
+                if header.startswith(b"XEX2"):
+                    return True
                 return False
         except Exception as e:
             logger.debug(f"Could not read file header for {path}: {e}")
             return False
+
+    @staticmethod
+    def detect_language_for_binary(binary_path: Path) -> str | None:
+        """
+        Detect the appropriate Ghidra language ID based on binary format.
+
+        Returns a Ghidra language ID string (e.g., "PowerPC:BE:64:Xenon") if a
+        specific language is needed, or None to let Ghidra auto-detect.
+        """
+        try:
+            with binary_path.open("rb") as f:
+                header = f.read(4)
+                # XEX2 (Xbox 360) requires PowerPC:BE:64:Xenon language
+                if header.startswith(b"XEX2"):
+                    return "PowerPC:BE:64:Xenon"
+        except Exception as e:
+            logger.debug(f"Could not detect language for {binary_path}: {e}")
+        return None
 
     def _import_callback(self, future: concurrent.futures.Future):
         """
