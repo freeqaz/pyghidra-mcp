@@ -2,10 +2,17 @@
 # ---------------------------------------------------------------------------------
 import json
 import logging
+import os
+import signal
+import socket
+import subprocess
 import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Optional
 
 import click
 import pyghidra
@@ -16,6 +23,7 @@ from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
 from pyghidra_mcp.__init__ import __version__
+from pyghidra_mcp.cache_manager import CacheManager
 from pyghidra_mcp.context import PyGhidraContext
 from pyghidra_mcp.models import (
     BinaryMetadata,
@@ -27,6 +35,7 @@ from pyghidra_mcp.models import (
     CrossReferenceInfos,
     DecompiledFunction,
     ExportInfos,
+    FunctionSearchResults,
     ImportInfos,
     ProgramInfo,
     ProgramInfos,
@@ -35,12 +44,44 @@ from pyghidra_mcp.models import (
 )
 from pyghidra_mcp.tools import GhidraTools
 
-logging.basicConfig(
-    level=logging.INFO,
-    stream=sys.stderr,  # Critical for STDIO transport
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-logger = logging.getLogger(__name__)
+# Setup logging with both console and file output
+def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
+    """Configure logging with console and optional file output."""
+    _logger = logging.getLogger(__name__)
+    _logger.setLevel(logging.DEBUG)
+
+    # Console handler (stderr for stdio transport compatibility)
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    console_handler.setFormatter(console_formatter)
+    _logger.addHandler(console_handler)
+
+    # File handler with rotation (if log file specified)
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        file_handler = RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=10,  # Keep 10 files
+        )
+        file_handler.setLevel(logging.DEBUG)
+        file_formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        )
+        file_handler.setFormatter(file_formatter)
+        _logger.addHandler(file_handler)
+
+    return _logger
+
+
+# Initialize logger (will be reconfigured with log file in main())
+logger = setup_logging()
+
+# Service start time for uptime tracking
+SERVICE_START_TIME = time.time()
 
 
 # Init Pyghidra
@@ -58,8 +99,186 @@ async def server_lifespan(server: Server) -> AsyncIterator[PyGhidraContext]:
 mcp = FastMCP("pyghidra-mcp", lifespan=server_lifespan)  # type: ignore
 
 
+# Port Management and Diagnostics
+# ---------------------------------------------------------------------------------
+def cleanup_stale_port(port: int = 8000, timeout_seconds: int = 5) -> bool:
+    """Kill stale processes using the port and wait for it to become available.
+
+    Args:
+        port: Port number to clean up
+        timeout_seconds: How long to wait for port to become free
+
+    Returns:
+        True if port is available, False if timeout
+    """
+    try:
+        result = subprocess.run(
+            ["lsof", "-i", f":{port}", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.stdout.strip():
+            pids = result.stdout.strip().split("\n")
+            for pid in pids:
+                try:
+                    pid_int = int(pid.strip())
+                    os.kill(pid_int, signal.SIGKILL)
+                    logger.info(f"Killed stale process {pid_int} on port {port}")
+                    time.sleep(0.1)
+                except (ValueError, ProcessLookupError, PermissionError) as e:
+                    logger.debug(f"Could not kill PID {pid}: {e}")
+    except FileNotFoundError:
+        logger.debug("lsof not available, skipping port cleanup")
+    except Exception as e:
+        logger.debug(f"Port cleanup error: {e}")
+
+    # Wait for port to be free
+    start_time = time.time()
+    while time.time() - start_time < timeout_seconds:
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+            sock.close()
+            time.sleep(0.2)
+        except (ConnectionRefusedError, socket.timeout):
+            logger.info(f"Port {port} is now available")
+            return True
+
+    logger.warning(f"Port {port} still in use after {timeout_seconds}s (may proceed anyway)")
+    return False
+
+
+def diagnose() -> None:
+    """Run diagnostics for the Ghidra service and print results."""
+    print("=" * 70)
+    print("Ghidra Service Diagnostics")
+    print("=" * 70)
+
+    # Check Ghidra install
+    ghidra_home = os.environ.get("GHIDRA_INSTALL_DIR")
+    print(f"\nGhidra Installation:")
+    print(f"  GHIDRA_INSTALL_DIR: {ghidra_home}")
+    if ghidra_home:
+        print(f"  Exists: {os.path.exists(ghidra_home)}")
+        if os.path.exists(ghidra_home):
+            print(f"  Writable: {os.access(ghidra_home, os.W_OK)}")
+
+    ghidra_user = os.environ.get("GHIDRA_USER_HOME")
+    print(f"  GHIDRA_USER_HOME: {ghidra_user}")
+    if ghidra_user:
+        print(f"  Exists: {os.path.exists(ghidra_user)}")
+        if os.path.exists(ghidra_user):
+            print(f"  Writable: {os.access(ghidra_user, os.W_OK)}")
+
+    # Check Java
+    java_home = os.environ.get("JAVA_HOME")
+    print(f"\nJava Configuration:")
+    print(f"  JAVA_HOME: {java_home}")
+    if java_home and os.path.exists(os.path.join(java_home, "bin", "java")):
+        print(f"  Java executable found")
+
+    # Check port
+    port = 8000
+    print(f"\nPort Status (Port {port}):")
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=1)
+        sock.close()
+        print(f"  Status: IN USE (likely by existing service)")
+    except (ConnectionRefusedError, socket.timeout):
+        print(f"  Status: AVAILABLE")
+    except Exception as e:
+        print(f"  Status: ERROR - {e}")
+
+    # Check temp directories
+    print(f"\nTemporary Directories:")
+    for tmpdir in ["/tmp/claude", "/tmp"]:
+        exists = os.path.exists(tmpdir)
+        writable = os.access(tmpdir, os.W_OK) if exists else False
+        print(f"  {tmpdir}: exists={exists}, writable={writable}")
+
+    # Check logs
+    print(f"\nService Logs:")
+    log_file = "/tmp/claude/pyghidra-service.log"
+    if os.path.exists(log_file):
+        size = os.path.getsize(log_file)
+        print(f"  {log_file}: {size} bytes")
+        try:
+            with open(log_file, "r") as f:
+                lines = f.readlines()
+                print(f"  Last 5 log entries:")
+                for line in lines[-5:]:
+                    print(f"    {line.rstrip()}")
+        except Exception as e:
+            print(f"  Error reading logs: {e}")
+    else:
+        print(f"  {log_file}: not found")
+
+    print("\n" + "=" * 70)
+
+
 # MCP Tools
 # ---------------------------------------------------------------------------------
+@mcp.tool()
+def get_service_health(ctx: Context) -> dict:
+    """Returns health status of the Ghidra service.
+
+    This endpoint can be called to verify the service is running and responsive.
+    Returns uptime, version, and Ghidra readiness status.
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        uptime_seconds = int(time.time() - SERVICE_START_TIME)
+        ghidra_ready = (
+            len(pyghidra_context.programs) > 0
+            if pyghidra_context else False
+        )
+
+        return {
+            "status": "healthy",
+            "version": __version__,
+            "uptime_seconds": uptime_seconds,
+            "ghidra_ready": ghidra_ready,
+            "programs_loaded": len(pyghidra_context.programs) if pyghidra_context else 0,
+        }
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        return {
+            "status": "error",
+            "version": __version__,
+            "error": str(e),
+        }
+
+
+@mcp.tool()
+def search_functions_by_name(
+    binary_name: str, query: str, ctx: Context, offset: int = 0, limit: int = 100
+) -> FunctionSearchResults:
+    """Searches for functions within a binary by name.
+
+    This is a dedicated function search that finds functions with names containing
+    the query string. For broader symbol searches (including labels, variables, etc.),
+    use search_symbols_by_name instead.
+
+    Args:
+        binary_name: The name of the binary to search within.
+        query: The substring to search for in function names (case-insensitive).
+        offset: The number of results to skip.
+        limit: The maximum number of results to return.
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        functions = tools.search_functions_by_name(query, offset, limit)
+        return FunctionSearchResults(functions=functions)
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error searching for functions: {e!s}")
+        ) from e
+
+
 @mcp.tool()
 async def decompile_function(
     binary_name: str, name_or_address: str, ctx: Context
@@ -73,7 +292,8 @@ async def decompile_function(
     try:
         pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
         program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
+        cache_manager = getattr(mcp, '_cache_manager', None)
+        tools = GhidraTools(program_info, cache_manager=cache_manager)
         return tools.decompile_function_by_name_or_addr(name_or_address)
     except Exception as e:
         if isinstance(e, ValueError):
@@ -81,6 +301,28 @@ async def decompile_function(
         raise McpError(
             ErrorData(code=INTERNAL_ERROR, message=f"Error decompiling function: {e!s}")
         ) from e
+
+
+@mcp.tool()
+def get_cache_stats(ctx: Context) -> dict:
+    """Returns decompilation cache statistics.
+
+    Returns cache hit count, entry count, hit rate, and cache size.
+    Useful for diagnostics and understanding cache performance.
+    """
+    try:
+        cache_manager = getattr(mcp, '_cache_manager', None)
+        if not cache_manager:
+            return {
+                "enabled": False,
+                "message": "Cache not initialized",
+            }
+        return cache_manager.get_stats()
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {e}")
+        return {
+            "error": str(e),
+        }
 
 
 @mcp.tool()
@@ -475,6 +717,66 @@ def import_binary(binary_path: str, ctx: Context) -> str:
         ) from e
 
 
+def _detect_binary_language(binary_path: Path) -> tuple[str | None, str | None]:
+    """Detect binary format and return language/compiler IDs if needed.
+
+    When XEXLoaderWV is installed via _install_xex_loader(), XEX files are
+    handled natively and don't need a language hint. Falls back to explicit
+    language specification if the loader isn't available.
+    """
+    try:
+        with binary_path.open("rb") as f:
+            header = f.read(4)
+            if header.startswith(b"XEX2"):
+                # Check if XEXLoaderWV is installed
+                ghidra_dir = os.environ.get("GHIDRA_INSTALL_DIR", "")
+                ext_dir = Path(ghidra_dir) / "Extensions" / "XEXLoaderWV" if ghidra_dir else None
+                if ext_dir and ext_dir.exists():
+                    # XEX loader handles format parsing, but we must specify
+                    # the Xenon language variant for VMX128 instruction support
+                    logger.info("XEX binary detected, using XEXLoaderWV with Xenon language")
+                    return "PowerPC:BE:64:Xenon", None
+                else:
+                    # Fallback: import as raw binary with PowerPC language
+                    logger.info("XEX binary detected, no XEXLoaderWV - using raw import")
+                    return "PowerPC:BE:64:Xenon", None
+    except Exception as e:
+        logger.debug(f"Could not detect language for {binary_path}: {e}")
+    return None, None
+
+
+def _install_xex_loader(launcher: "pyghidra.HeadlessPyGhidraLauncher"):
+    """Install XEXLoaderWV extension if available, so Ghidra can import XEX files natively."""
+    # Look for the built dist zip first (preferred by install_plugin)
+    xex_loader_home = Path.home() / "code" / "milohax" / "XEXLoaderWV" / "XEXLoaderWV"
+    dist_dir = xex_loader_home / "dist"
+    if dist_dir.exists():
+        zips = sorted(dist_dir.glob("*.zip"))
+        if zips:
+            zip_path = zips[-1]  # Latest zip
+            try:
+                details = pyghidra.ExtensionDetails.from_file(xex_loader_home)
+                launcher.install_plugin(zip_path, details)
+                logger.info(f"Installed XEXLoaderWV from {zip_path}")
+                return
+            except Exception as e:
+                logger.warning(f"install_plugin failed with zip: {e}")
+
+    # Fallback: add jar to classpath directly
+    ghidra_dir = os.environ.get("GHIDRA_INSTALL_DIR", "")
+    if not ghidra_dir:
+        return
+    jar = Path(ghidra_dir) / "Extensions" / "XEXLoaderWV" / "lib" / "XEXLoaderWV.jar"
+    if jar.exists():
+        try:
+            launcher.add_class_files(jar)
+            logger.info(f"Added XEXLoaderWV jar to classpath: {jar}")
+        except Exception as e:
+            logger.warning(f"Failed to add XEXLoaderWV jar: {e}")
+    else:
+        logger.debug("XEXLoaderWV not found")
+
+
 def init_pyghidra_context(
     mcp: FastMCP,
     input_paths: list[Path],
@@ -623,6 +925,42 @@ def init_pyghidra_context(
     show_default=True,
     help="Wait for initial project analysis to complete before starting the server.",
 )
+@optgroup.option(
+    "--log-file",
+    type=click.Path(),
+    help="Path to log file for rotating file logging (max 10MB, 10 backups).",
+)
+@optgroup.option(
+    "--diagnose",
+    is_flag=True,
+    help="Run service diagnostics and exit.",
+)
+# --- Cache Options ---
+@optgroup.group("Cache Options")
+@optgroup.option(
+    "--cache-dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Directory to store decompilation cache (cache.db). Defaults to current directory.",
+)
+@optgroup.option(
+    "--cache-disabled",
+    is_flag=True,
+    default=False,
+    help="Disable decompilation caching for this run.",
+)
+@optgroup.option(
+    "--cache-clear",
+    is_flag=True,
+    default=False,
+    help="Clear entire decompilation cache and exit.",
+)
+@optgroup.option(
+    "--cache-stats",
+    is_flag=True,
+    default=False,
+    help="Print cache statistics and exit.",
+)
 # --- Project Options ---
 @optgroup.group("Project Management")
 @optgroup.option(
@@ -689,6 +1027,12 @@ def main(
     wait_for_analysis: bool,
     list_project_binaries: bool,
     delete_project_binary: str | None,
+    log_file: str | None,
+    diagnose: bool,
+    cache_dir: Path | None,
+    cache_disabled: bool,
+    cache_clear: bool,
+    cache_stats: bool,
 ) -> None:
     """PyGhidra Command-Line MCP server
 
@@ -698,6 +1042,36 @@ def main(
     For streamable-http and sse, it will start an HTTP server on the specified port (default 8000).
 
     """
+    global logger
+
+    # Handle --diagnose flag early (before any initialization)
+    if diagnose:
+        diagnose()
+        sys.exit(0)
+
+    # Reconfigure logging with file output if specified
+    if log_file:
+        logger = setup_logging(log_file)
+        logger.info(f"Logging to file: {log_file}")
+
+    # Initialize cache manager
+    cache_dir_path = cache_dir if cache_dir else Path.cwd()
+    cache_manager = CacheManager(cache_dir=cache_dir_path, enabled=not cache_disabled)
+    mcp._cache_manager = cache_manager  # type: ignore
+
+    # Handle cache management commands
+    if cache_clear:
+        cleared = cache_manager.clear()
+        logger.info(f"Cache cleared: {cleared} entries removed")
+        click.echo(f"Cache cleared: {cleared} entries removed")
+        sys.exit(0)
+
+    if cache_stats:
+        stats = cache_manager.get_stats()
+        logger.info(f"Cache stats: {json.dumps(stats)}")
+        click.echo(json.dumps(stats, indent=2))
+        sys.exit(0)
+
     project_name = project_path.stem
     project_directory = str(project_path.parent)
     mcp.settings.port = port
