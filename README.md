@@ -2,6 +2,8 @@
   <img src="https://github.com/user-attachments/assets/31c1831a-5be1-4698-8171-5ebfc9d6797c" width=60% >
 </p>
 
+> **Fork Notice:** This is [freeqaz/pyghidra-mcp](https://github.com/freeqaz/pyghidra-mcp), a fork of [clearbluejar/pyghidra-mcp](https://github.com/clearbluejar/pyghidra-mcp) with additional features for decompilation workflows: **decompilation caching**, **multi-strategy function lookup** (map files, MSVC demangling), and **Xbox 360 XEX support**. See [Fork Features](#fork-features-freeqazpyghidra-mcp) below.
+
 <p align="center">
   <img align="center" alt="GitHub Workflow Status (with event)" src="https://img.shields.io/github/actions/workflow/status/clearbluejar/pyghidra-mcp/pytest-devcontainer-repo-all.yml?style=for-the-badge&label=pytest">
   <img align="center" alt="PyPI - Downloads" src="https://img.shields.io/pypi/dm/pyghidra-mcp?color=yellow&label=PyPI%20downloads&style=for-the-badge">
