@@ -38,6 +38,34 @@ Yes, the original [ghidra-mcp](https://github.com/LaurieWired/GhidraMCP) is fant
 
 This project provides a Python-first experience optimized for local development, headless environments, and testable workflows.
 
+## Fork Features (freeqaz/pyghidra-mcp)
+
+This fork adds features for decompilation workflows, particularly for game reverse engineering:
+
+### Decompilation Caching
+SQLite-backed cache that stores decompiled function output, avoiding repeated ~0.2s Ghidra queries:
+```bash
+pyghidra-mcp --cache-dir ./cache /path/to/binary  # Enable caching
+pyghidra-mcp --cache-stats                         # View cache statistics
+pyghidra-mcp --cache-clear                         # Clear cache
+```
+
+### Multi-Strategy Function Lookup
+Enhanced `find_function()` that tries multiple strategies to locate functions:
+1. **Direct hex address** – `0x82E4E6B8` or `82E4E6B8`
+2. **Map file lookup** – O(1) address resolution from linker `.map` files
+3. **Exact name match** – Standard Ghidra lookup
+4. **MSVC demangled name** – `CharBonesMeshes::PoseMeshes` from `?PoseMeshes@CharBonesMeshes@@QAAXXZ`
+5. **Method name only** – `PoseMeshes` matches any class containing that method
+6. **Partial/substring match** – Last resort fuzzy matching
+
+### XEX (Xbox 360) Support
+Automatic detection and loading of Xbox 360 XEX binaries with proper PowerPC:BE:64:Xenon language selection. Integrates with [XEXLoaderWV](https://github.com/XEXLoaderWV/XEXLoaderWV) extension when available.
+
+### Additional MCP Tools
+- `get_cache_stats()` – Returns cache hit rate, entry count, and size
+- `search_functions_by_name()` – Dedicated function search (vs broader symbol search)
+
 ```mermaid
 graph TD
     subgraph Clients
