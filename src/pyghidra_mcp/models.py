@@ -240,3 +240,58 @@ class CallGraphResult(BaseModel):
     )
     graph: str = Field(..., description="The MermaidJS markdown string for the call graph.")
     mermaid_url: str = Field(..., description="The MermaidJS image url")
+
+
+class StructureMemberInfo(BaseModel):
+    """A member/field within a structure."""
+
+    name: str | None = Field(None, description="Field name (may be None for undefined)")
+    type_name: str = Field(..., description="Data type name")
+    offset: int = Field(..., description="Byte offset within the structure")
+    size: int = Field(..., description="Size in bytes")
+
+
+class StructureInfo(BaseModel):
+    """A structure/class data type from Ghidra's Data Type Manager."""
+
+    name: str = Field(..., description="Structure name")
+    category: str = Field(..., description="Category path (e.g. '/DC3/classes')")
+    size: int = Field(..., description="Total size in bytes")
+    num_members: int = Field(..., description="Number of defined members")
+    members: list[StructureMemberInfo] = Field(..., description="Structure members")
+
+
+class StructureListResult(BaseModel):
+    """Result of listing structures from the Data Type Manager."""
+
+    structures: list[StructureInfo] = Field(..., description="Matched structures")
+    total_count: int = Field(..., description="Total structures matching filter")
+
+
+class SwitchInfo(BaseModel):
+    """Information about a detected switch statement in a function."""
+
+    address: str = Field(..., description="Address of the bctr instruction (switch jump)")
+    case_count: int | None = Field(
+        None, description="Estimated number of cases if detectable from bounds check"
+    )
+    index_register: str | None = Field(
+        None, description="Register used for switch index if detected"
+    )
+    table_address: str | None = Field(
+        None, description="Address of jump table if detected"
+    )
+
+
+class SwitchDetectionResult(BaseModel):
+    """Result of switch statement detection for a function."""
+
+    function_name: str = Field(..., description="Name of the analyzed function")
+    function_address: str = Field(..., description="Entry point address of the function")
+    switches: list[SwitchInfo] = Field(
+        default_factory=list, description="Detected switch statements"
+    )
+    note: str = Field(
+        default="If Ghidra shows if-else chains, they are likely switch statements",
+        description="Interpretation guidance"
+    )

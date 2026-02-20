@@ -14,6 +14,8 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
 
+import re
+
 import click
 import pyghidra
 from click_option_group import optgroup
@@ -40,6 +42,8 @@ from pyghidra_mcp.models import (
     ProgramInfo,
     ProgramInfos,
     StringSearchResults,
+    StructureInfo,
+    StructureListResult,
     SymbolSearchResults,
 )
 from pyghidra_mcp.tools import GhidraTools
@@ -644,6 +648,208 @@ def read_bytes(binary_name: str, ctx: Context, address: str, size: int = 32) -> 
 
 
 @mcp.tool()
+def list_structures(
+    binary_name: str,
+    ctx: Context,
+    query: str = ".*",
+    offset: int = 0,
+    limit: int = 100,
+) -> StructureListResult:
+    """List structure/class data types from Ghidra's Data Type Manager.
+
+    Returns structure layouts including member names, types, offsets, and sizes.
+    Use query to filter by name (regex). Paginate with offset/limit.
+
+    Args:
+        binary_name: The name of the binary to inspect.
+        query: Regex pattern to filter structure names (case-insensitive).
+        offset: Number of results to skip (for pagination).
+        limit: Maximum number of results to return.
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        structures, total = tools.get_structures(query, offset, limit)
+        return StructureListResult(
+            structures=[StructureInfo(**s) for s in structures],
+            total_count=total,
+        )
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error listing structures: {e!s}")
+        ) from e
+
+
+@mcp.tool()
+def extract_structures(
+    binary_name: str,
+    ctx: Context,
+    max_functions: int = 0,
+    timeout_per_func: int = 30,
+) -> dict:
+    """Extract structure types by batch-decompiling functions.
+
+    Ghidra's DTM is empty after headless analysis. This tool decompiles functions
+    to trigger the decompiler's type inference, then collects any Structure types
+    it discovers from local/global variables and parameters.
+
+    This is a long-running operation (minutes to hours for large binaries).
+    Use max_functions to limit scope for testing.
+
+    Args:
+        binary_name: The name of the binary to analyze.
+        max_functions: Max functions to decompile (0 = all).
+        timeout_per_func: Decompiler timeout per function in seconds.
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        structures, stats = tools.extract_structures(max_functions, timeout_per_func)
+        return {
+            "structures": structures,
+            "total_count": len(structures),
+            "stats": stats,
+        }
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error extracting structures: {e!s}")
+        ) from e
+
+
+@mcp.tool()
+def create_structures(
+    binary_name: str,
+    class_defs: list[dict],
+    ctx: Context,
+) -> dict:
+    """Create structure data types in Ghidra's Data Type Manager.
+
+    Seeds the DTM with structure definitions from DC3 headers, enabling the
+    decompiler to use these types for type propagation and member inference.
+
+    Args:
+        binary_name: The name of the binary to operate on.
+        class_defs: List of class definitions. Each dict should have:
+            - name: str (class name)
+            - members: list of {"name": str, "type_str": str, "offset": int, "size": int?}
+            - total_size: int? (optional total size)
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        result = tools.create_structures(class_defs)
+        # Persist to disk so structs survive restarts
+        pyghidra_context.project.save(program_info.program)
+        return result
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error creating structures: {e!s}")
+        ) from e
+
+
+@mcp.tool()
+def apply_this_types(
+    binary_name: str,
+    class_methods: dict,
+    ctx: Context,
+) -> dict:
+    """Apply this pointer types to member functions.
+
+    Sets the first parameter (this) of member functions to the appropriate
+    class pointer type, enabling better type propagation in the decompiler.
+
+    Args:
+        binary_name: The name of the binary to operate on.
+        class_methods: Dict mapping class names to lists of function addresses.
+            Format: {"ClassName": ["823486e0", "82348700", ...]}
+            Addresses should be hex strings without 0x prefix.
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        return tools.apply_this_types(class_methods)
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error applying this types: {e!s}")
+        ) from e
+
+
+@mcp.tool()
+def bulk_create_functions(
+    binary_name: str,
+    addresses: list[str],
+    ctx: Context,
+) -> dict:
+    """Create Function objects at addresses where Ghidra auto-analysis missed them.
+
+    Many map file addresses have code but no Ghidra function object. This bulk-creates
+    functions so they can be decompiled and have signatures applied.
+
+    Args:
+        binary_name: The name of the binary to operate on.
+        addresses: List of hex address strings without 0x prefix (e.g., ["823486e0", "82348700"]).
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        result = tools.bulk_create_functions(addresses)
+        pyghidra_context.project.save(program_info.program)
+        return result
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error creating functions: {e!s}")
+        ) from e
+
+
+@mcp.tool()
+def apply_demangled_signatures(
+    binary_name: str,
+    symbols: list[dict],
+    ctx: Context,
+) -> dict:
+    """Apply full function signatures by demangling MSVC mangled names.
+
+    Uses Ghidra's MicrosoftDemangler to parse mangled names into complete function
+    signatures (calling convention, return type, all parameter types) and applies them.
+    This is far more powerful than apply_this_types as it sets ALL parameters, not just this*.
+
+    Args:
+        binary_name: The name of the binary to operate on.
+        symbols: List of dicts, each with:
+            - "mangled": MSVC mangled name (e.g., "?Load@CharBonesSamples@@QAAXAAVBinStream@@@Z")
+            - "address": hex address without 0x prefix (e.g., "823486e0")
+    """
+    try:
+        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
+        program_info = pyghidra_context.get_program_info(binary_name)
+        tools = GhidraTools(program_info)
+        result = tools.apply_demangled_signatures(symbols)
+        pyghidra_context.project.save(program_info.program)
+        return result
+    except Exception as e:
+        if isinstance(e, ValueError):
+            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
+        raise McpError(
+            ErrorData(code=INTERNAL_ERROR, message=f"Error applying demangled signatures: {e!s}")
+        ) from e
+
+
+@mcp.tool()
 def gen_callgraph(
     binary_name: str,
     function_name: str,
@@ -777,6 +983,147 @@ def _install_xex_loader(launcher: "pyghidra.HeadlessPyGhidraLauncher"):
         logger.debug("XEXLoaderWV not found")
 
 
+def _apply_map_symbols(
+    pyghidra_context: PyGhidraContext,
+    map_file: Path,
+) -> None:
+    """Apply symbols from an MSVC linker .map file to all programs in the project.
+
+    Parses the "Publics by Value" section of the map file and creates named
+    symbols at the corresponding addresses in Ghidra, replacing auto-generated
+    names like FUN_828853d8 with the real mangled names from the linker.
+
+    Only applies symbols once per program — skips if IMPORTED symbols already exist.
+
+    Args:
+        pyghidra_context: The active Ghidra project context.
+        map_file: Path to the MSVC linker .map file.
+    """
+    from ghidra.program.model.symbol import SourceType, SymbolUtilities
+
+    if not map_file.exists():
+        logger.warning(f"Map file not found: {map_file}")
+        return
+
+    for prog_path, program_info in pyghidra_context.programs.items():
+        program = program_info.program
+
+        # Check if map symbols were already applied via a program property marker
+        MAP_SYMBOLS_OPTION = "Map Symbols Applied v4"
+        prog_options = program.getOptions("pyghidra-mcp")
+        if prog_options.getBoolean(MAP_SYMBOLS_OPTION, False):
+            logger.info(f"Map symbols already applied to {prog_path}, skipping")
+            continue
+
+        logger.info(f"Applying map symbols to {prog_path} from {map_file}")
+
+        # Parse "Publics by Value" section
+        # Format: 0005:000186e0   ?PoseMeshes@CharBonesMeshes@@QAAXXZ 823486e0 f   char:CharBonesMeshes.obj
+        symbol_pattern = re.compile(
+            r"^\s*[0-9a-fA-F]{4}:[0-9a-fA-F]+\s+(\S+)\s+([0-9a-fA-F]{8})"
+        )
+
+        symbols_to_apply: list[tuple[str, int]] = []
+        in_publics = False
+        with open(map_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "Publics by Value" in line:
+                    in_publics = True
+                    continue
+                if not in_publics:
+                    continue
+                match = symbol_pattern.match(line)
+                if match:
+                    symbol_name = match.group(1)
+                    address = int(match.group(2), 16)
+                    symbols_to_apply.append((symbol_name, address))
+
+        if not symbols_to_apply:
+            logger.warning("No symbols found in map file")
+            continue
+
+        logger.info(f"Parsed {len(symbols_to_apply)} symbols from map file")
+
+        addr_factory = program.getAddressFactory()
+        memory = program.getMemory()
+
+        fm = program.getFunctionManager()
+
+        txn = program.startTransaction("Import map symbols")
+        try:
+            count = 0
+            renamed = 0
+            rename_failed = 0
+            skipped = 0
+            for symbol_name, addr_int in symbols_to_apply:
+                try:
+                    addr = addr_factory.getDefaultAddressSpace().getAddress(addr_int)
+                    if addr and memory.contains(addr):
+                        # Check if a function exists at this address with an auto name
+                        func = fm.getFunctionAt(addr)
+                        if func:
+                            func_name = func.getName()
+                            is_auto = (
+                                func_name.startswith("FUN_")
+                                or func_name.startswith("Function_")
+                                or func_name.startswith("thunk_FUN_")
+                            )
+                            if is_auto:
+                                # Remove any existing label with the same name at this address
+                                # (from prior createPreferredLabelOrFunctionSymbol calls)
+                                st = program.getSymbolTable()
+                                for existing_sym in list(st.getSymbols(addr)):
+                                    if (existing_sym.getName() == symbol_name
+                                            and existing_sym != func.getSymbol()):
+                                        existing_sym.delete()
+                                # Rename the function directly instead of creating a label
+                                try:
+                                    func.setName(symbol_name, SourceType.IMPORTED)
+                                    renamed += 1
+                                except Exception as rename_err:
+                                    rename_failed += 1
+                                    if rename_failed <= 5:
+                                        logger.debug(
+                                            f"Failed to rename {func_name} at "
+                                            f"0x{addr_int:08x} to {symbol_name}: {rename_err}"
+                                        )
+                            else:
+                                # Function already has a real name, add as label
+                                SymbolUtilities.createPreferredLabelOrFunctionSymbol(
+                                    program, addr, None, symbol_name, SourceType.IMPORTED
+                                )
+                        else:
+                            # No function — create a label or function symbol
+                            SymbolUtilities.createPreferredLabelOrFunctionSymbol(
+                                program, addr, None, symbol_name, SourceType.IMPORTED
+                            )
+                        count += 1
+                    else:
+                        skipped += 1
+                except Exception:
+                    skipped += 1
+
+            program.endTransaction(txn, True)
+            logger.info(
+                f"Applied {count} symbols, renamed {renamed} functions, "
+                f"{rename_failed} rename failures ({skipped} skipped)"
+            )
+
+            # Mark that map symbols have been applied so we don't re-apply on next startup
+            txn2 = program.startTransaction("Mark map symbols applied")
+            try:
+                prog_options.setBoolean(MAP_SYMBOLS_OPTION, True)
+                program.endTransaction(txn2, True)
+            except Exception:
+                program.endTransaction(txn2, False)
+        except Exception:
+            program.endTransaction(txn, False)
+            logger.error("Failed to apply map symbols, transaction rolled back", exc_info=True)
+
+        # Save the program with new symbols
+        pyghidra_context.project.save(program)
+
+
 def init_pyghidra_context(
     mcp: FastMCP,
     input_paths: list[Path],
@@ -793,6 +1140,7 @@ def init_pyghidra_context(
     wait_for_analysis: bool,
     list_project_binaries: bool,
     delete_project_binary: str | None,
+    map_file: str | None = None,
 ) -> FastMCP:
     bin_paths: list[str | Path] = [Path(p) for p in input_paths]
     logger.info(f"Project: {project_name}")
@@ -803,8 +1151,10 @@ def init_pyghidra_context(
         with open(program_options_path) as f:
             program_options = json.load(f)
 
-    # init pyghidra
-    pyghidra.start(False)  # setting Verbose output
+    # init pyghidra with XEX loader extension (if available)
+    launcher = pyghidra.HeadlessPyGhidraLauncher(verbose=False)
+    _install_xex_loader(launcher)
+    launcher.start()
 
     # init PyGhidraContext / import + analyze binaries
     logger.info("Server initializing...")
@@ -849,6 +1199,11 @@ def init_pyghidra_context(
 
     logger.info(f"Analyzing project: {pyghidra_context.project}")
     pyghidra_context.analyze_project()
+
+    # Apply map file symbols after analysis (if provided)
+    if map_file:
+        map_path = Path(map_file)
+        _apply_map_symbols(pyghidra_context, map_path)
 
     if len(pyghidra_context.list_binaries()) == 0:
         logger.warning("No binaries were imported and none exist in the project.")
@@ -1009,6 +1364,12 @@ def init_pyghidra_context(
     type=click.Path(),
     help="Location to store GZFs of analyzed binaries.",
 )
+@optgroup.option(
+    "--map-file",
+    type=click.Path(exists=True),
+    help="Path to an MSVC linker .map file. Symbols from 'Publics by Value' "
+         "will be applied to the Ghidra project after analysis.",
+)
 @click.argument("input_paths", type=click.Path(exists=True), nargs=-1)
 def main(
     transport: str,
@@ -1023,6 +1384,7 @@ def main(
     gdt: tuple[str, ...],
     program_options: str | None,
     gzfs_path: str | None,
+    map_file: str | None,
     max_workers: int,
     wait_for_analysis: bool,
     list_project_binaries: bool,
@@ -1093,6 +1455,7 @@ def main(
         wait_for_analysis=wait_for_analysis,
         list_project_binaries=list_project_binaries,
         delete_project_binary=delete_project_binary,
+        map_file=map_file,
     )
 
     try:

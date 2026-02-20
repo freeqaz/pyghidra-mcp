@@ -130,6 +130,8 @@ class PyGhidraContext:
         """
         for _program_name, program_info in self.programs.items():
             program = program_info.program
+            if save:
+                self.project.save(program)
             self.project.close(program)
 
         if self.executor:
@@ -564,12 +566,16 @@ class PyGhidraContext:
                     logger.error(f"Failed to decompile {func.getSymbol().getName(True)}: {e}")
 
             collection = self.chroma_client.create_collection(name=program_info.name)
+            BATCH_SIZE = 5000
             try:
-                collection.add(
-                    documents=decompiles,
-                    metadatas=metadatas,
-                    ids=ids,
-                )
+                for batch_start in range(0, len(decompiles), BATCH_SIZE):
+                    batch_end = batch_start + BATCH_SIZE
+                    collection.add(
+                        documents=decompiles[batch_start:batch_end],
+                        metadatas=metadatas[batch_start:batch_end],
+                        ids=ids[batch_start:batch_end],
+                    )
+                    logger.info(f"Indexed code batch {batch_start}-{min(batch_end, len(decompiles))}/{len(decompiles)}")
             except Exception as e:
                 logger.error(f"Failed add decompiles to collection: {e}")
 
@@ -597,12 +603,16 @@ class PyGhidraContext:
             strings = [s.value for s in strings]
 
             strings_collection = self.chroma_client.create_collection(name=collection_name)
+            BATCH_SIZE = 5000
             try:
-                strings_collection.add(
-                    documents=strings,
-                    metadatas=metadatas,  # type: ignore
-                    ids=ids,
-                )
+                for batch_start in range(0, len(strings), BATCH_SIZE):
+                    batch_end = batch_start + BATCH_SIZE
+                    strings_collection.add(
+                        documents=strings[batch_start:batch_end],
+                        metadatas=metadatas[batch_start:batch_end],
+                        ids=ids[batch_start:batch_end],
+                    )
+                    logger.info(f"Indexed strings batch {batch_start}-{min(batch_end, len(strings))}/{len(strings)}")
             except Exception as e:
                 logger.error(f"Failed to add strings to collection: {e}")
 

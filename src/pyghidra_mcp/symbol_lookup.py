@@ -6,6 +6,7 @@ Provides multi-strategy function lookup:
 2. Demangled name match (Class::Method format)
 3. Address-based lookup (from map file)
 4. Partial/fuzzy matching
+5. String literal decoding (??_C@... symbols)
 """
 
 import logging
@@ -15,6 +16,83 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+def decode_msvc_string_literal(mangled: str) -> Optional[str]:
+    """Decode string literal from MSVC ??_C@... symbol.
+
+    MSVC encodes string literals as symbols with the format:
+        ??_C@_<flag><len>@<hash>@<literal>?$AA@
+
+    Components:
+    - ??_C@ - String literal prefix
+    - _0 or _1 - Encoding flag (0=single byte, 1=wide char)
+    - <len> - Base-32 encoded length
+    - <hash> - 8-char uppercase hash
+    - <literal> - The string with escape sequences
+    - ?$AA@ - Null terminator marker
+
+    Examples:
+        ??_C@_0O@EPEJKEFM@nar_bam_trans?$AA@ -> "nar_bam_trans"
+        ??_C@_07LEAMOHCB@App?4cpp?$AA@ -> "App.cpp"
+        ??_C@_0BH@MPLIJIBA@?1vo_bank_rehearse?4milo?$AA@ -> "/vo_bank_rehearse.milo"
+        ??_C@_0M@GKILHAJE@?$CK?$CKno?5file?$CK?$CK?$AA@ -> "**no file**"
+        ??_C@_0BB@OEPBHON@Couldn?8t?5load?5?$CFs?$AA@ -> "Couldn't load %s"
+        ??_C@_0L@JDNODHIG@mRefs?5?$DO?$DN?50?$AA@ -> "mRefs >= 0"
+
+    Args:
+        mangled: MSVC mangled string symbol name
+
+    Returns:
+        Decoded string literal, or None if not a string symbol
+    """
+    if not mangled.startswith("??_C@"):
+        return None
+
+    # MSVC string literal encoding has two formats:
+    # 1. Single-digit length: ??_C@_<flag><digit><hash>@<literal>?$AA@
+    #    Example: ??_C@_07LEAMOHCB@App?4cpp?$AA@
+    # 2. Letter/multi-char length: ??_C@_<flag><len>@<hash>@<literal>?$AA@
+    #    Example: ??_C@_0O@EPEJKEFM@nar_bam_trans?$AA@
+    # Hash is typically 7-8 uppercase letters
+
+    # Try single-digit length format first (no @ between length and hash)
+    match = re.match(r"\?\?_C@_[01]([0-9])([A-Z]{7,8})@(.+)\?\$AA@$", mangled)
+    if match:
+        literal = match.group(3)
+    else:
+        # Try letter/multi-char length format (@ between length and hash)
+        match = re.match(r"\?\?_C@_[01]([A-Z0-9]+)@([A-Z]{7,8})@(.+)\?\$AA@$", mangled)
+        if not match:
+            return None
+        literal = match.group(3)
+
+    # Decode MSVC escape sequences
+    # Order matters - do multi-char escapes first
+    multi_char_escapes = {
+        "?$CK": "*",   # asterisk
+        "?$CF": "%",   # percent
+        "?$DO": ">",   # greater than
+        "?$DM": "<",   # less than
+        "?$DN": "=",   # equals
+    }
+    for esc, char in multi_char_escapes.items():
+        literal = literal.replace(esc, char)
+
+    # Single-char numeric escapes
+    single_escapes = {
+        "?1": "/",     # forward slash
+        "?2": "\\",    # backslash
+        "?3": ":",     # colon
+        "?4": ".",     # period
+        "?5": " ",     # space
+        "?6": "\n",    # newline
+        "?8": "'",     # apostrophe
+    }
+    for esc, char in single_escapes.items():
+        literal = literal.replace(esc, char)
+
+    return literal
 
 
 @dataclass
@@ -190,6 +268,8 @@ class MapFileParser:
         self.map_path = Path(map_path)
         self._symbols: Dict[str, SymbolInfo] = {}
         self._address_to_symbol: Dict[int, str] = {}
+        self._address_to_string: Dict[int, str] = {}
+        self._address_to_symbols: Dict[int, List[str]] = {}
         self._parsed = False
 
     def parse(self) -> None:
@@ -247,6 +327,16 @@ class MapFileParser:
                     self._symbols[symbol] = info
                     self._address_to_symbol[rva_base] = symbol
 
+                    # Check if this is a string symbol
+                    string_value = decode_msvc_string_literal(symbol)
+                    if string_value is not None:
+                        self._address_to_string[rva_base] = string_value
+
+                    # Store in address->symbols list (for ICF-merged lookup)
+                    if rva_base not in self._address_to_symbols:
+                        self._address_to_symbols[rva_base] = []
+                    self._address_to_symbols[rva_base].append(symbol)
+
         self._parsed = True
         logger.info(f"Parsed {len(self._symbols)} symbols from map file")
 
@@ -285,6 +375,34 @@ class MapFileParser:
                     break
 
         return results
+
+    def lookup_string_by_address(self, address: int) -> Optional[str]:
+        """Look up decoded string literal by address.
+
+        Args:
+            address: Absolute address (Rva+Base from map file)
+
+        Returns:
+            Decoded string value, or None if not a string symbol
+        """
+        self.parse()
+        return self._address_to_string.get(address)
+
+    def lookup_all_symbols_by_address(self, address: int) -> List[SymbolInfo]:
+        """Look up all symbols at an address (for ICF-merged functions).
+
+        Multiple symbols can share the same address when the linker
+        performs Identical COMDAT Folding (ICF).
+
+        Args:
+            address: Absolute address (Rva+Base from map file)
+
+        Returns:
+            List of SymbolInfo objects at this address
+        """
+        self.parse()
+        mangled_names = self._address_to_symbols.get(address, [])
+        return [self._symbols[m] for m in mangled_names if m in self._symbols]
 
 
 class SymbolMatcher:
