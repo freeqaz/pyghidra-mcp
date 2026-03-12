@@ -289,10 +289,12 @@ class GhidraTools:
                 f"0x{raw_addr:08x}",
                 f"ram:0x{raw_addr:08x}",
             ]
+            found_raw_addr = None
             for addr_str in addr_formats:
                 try:
                     addr = self.program.getAddressFactory().getAddress(addr_str)
                     if addr:
+                        found_raw_addr = addr
                         func = fm.getFunctionAt(addr)
                         if func:
                             logger.debug(f"Found function by direct address: {name_or_address} -> {func.name}")
@@ -303,6 +305,19 @@ class GhidraTools:
                             return func
                 except Exception as e:
                     logger.debug(f"Direct address lookup failed for {addr_str}: {e}")
+
+            # Strategy 0b: Try creating function at direct address if not found
+            if found_raw_addr:
+                try:
+                    from ghidra.app.cmd.function import CreateFunctionCmd
+                    cmd = CreateFunctionCmd(found_raw_addr)
+                    if cmd.applyTo(self.program):
+                        func = fm.getFunctionAt(found_raw_addr)
+                        if func:
+                            logger.info(f"Created function at 0x{raw_addr:08x} (direct address lookup)")
+                            return func
+                except Exception as e:
+                    logger.debug(f"Failed to create function at 0x{raw_addr:08x}: {e}")
 
         # Strategy 1: Address lookup from map file (O(1) - try first!)
         address = self.symbol_matcher.get_address(name_or_address)
@@ -368,6 +383,14 @@ class GhidraTools:
             if name_or_address == func.name:
                 logger.debug(f"Found function by exact match: {name_or_address}")
                 return func
+            
+            # Check full name stripped of parameters (e.g. "MemHeap::Print(class TextStream &, bool)" -> "MemHeap::Print")
+            func_full = func.getSymbol().getName(True) if hasattr(func, "getSymbol") else func.name
+            func_no_params = func_full.split("(")[0].strip()
+            if name_or_address == func_full or name_or_address == func_no_params:
+                logger.debug(f"Found function by full name match: {name_or_address}")
+                return func
+
 
         # Strategy 3-5: Try search variants (demangled, method name, etc.)
         variants = self.symbol_matcher.get_search_variants(name_or_address)
