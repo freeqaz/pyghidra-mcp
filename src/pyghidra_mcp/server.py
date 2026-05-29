@@ -1138,6 +1138,8 @@ def init_pyghidra_context(
     threaded: bool,
     max_workers: int,
     wait_for_analysis: bool,
+    skip_code_collection: bool,
+    decompiler_timeout: int,
     list_project_binaries: bool,
     delete_project_binary: str | None,
     map_file: str | None = None,
@@ -1170,6 +1172,8 @@ def init_pyghidra_context(
         threaded=threaded,
         max_workers=max_workers,
         wait_for_analysis=wait_for_analysis,
+        skip_code_collection=skip_code_collection,
+        decompiler_timeout=decompiler_timeout,
     )
 
     if list_project_binaries:
@@ -1370,6 +1374,23 @@ def init_pyghidra_context(
     help="Path to an MSVC linker .map file. Symbols from 'Publics by Value' "
          "will be applied to the Ghidra project after analysis.",
 )
+@optgroup.option(
+    "--skip-code-collection/--with-code-collection",
+    default=False,
+    show_default=True,
+    help="Skip the ChromaDB code-collection build (the per-function decompile "
+         "pass). Avoids wedging on very large/monolithic binaries; search_code "
+         "becomes unavailable but the strings collection still builds.",
+)
+@optgroup.option(
+    "--decompiler-timeout",
+    type=int,
+    default=0,
+    show_default=True,
+    help="Per-function decompiler timeout in seconds (0 = no timeout). Bounds "
+         "both interactive and collection-build decompiles so a pathological "
+         "function fails fast instead of hanging.",
+)
 @click.argument("input_paths", type=click.Path(exists=True), nargs=-1)
 def main(
     transport: str,
@@ -1387,6 +1408,8 @@ def main(
     map_file: str | None,
     max_workers: int,
     wait_for_analysis: bool,
+    skip_code_collection: bool,
+    decompiler_timeout: int,
     list_project_binaries: bool,
     delete_project_binary: str | None,
     log_file: str | None,
@@ -1453,6 +1476,8 @@ def main(
         threaded=threaded,
         max_workers=max_workers,
         wait_for_analysis=wait_for_analysis,
+        skip_code_collection=skip_code_collection,
+        decompiler_timeout=decompiler_timeout,
         list_project_binaries=list_project_binaries,
         delete_project_binary=delete_project_binary,
         map_file=map_file,

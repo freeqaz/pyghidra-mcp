@@ -40,6 +40,7 @@ class ProgramInfo:
     load_time: float | None = None
     code_collection: chromadb.Collection | None = None
     strings_collection: chromadb.Collection | None = None
+    decompiler_timeout: int = 0
 
     @property
     def analysis_complete(self) -> bool:
@@ -65,6 +66,8 @@ class PyGhidraContext:
         threaded: bool = True,
         max_workers: int | None = None,
         wait_for_analysis: bool = False,
+        skip_code_collection: bool = False,
+        decompiler_timeout: int = 0,
     ):
         """
         Initializes a new Ghidra project context.
@@ -81,11 +84,19 @@ class PyGhidraContext:
             threaded: Use threading during analysis.
             max_workers: Number of workers for threaded analysis.
             wait_for_analysis: Wait for initial project analysis to complete.
+            skip_code_collection: Skip the ChromaDB code-collection build (the
+                per-function decompile pass); the strings collection still builds.
+            decompiler_timeout: Per-function decompiler timeout in seconds
+                (0 = no timeout), applied to interactive and build decompiles.
         """
         from ghidra.base.project import GhidraProject
 
         self.project_name = project_name
         self.project_path = Path(project_path)
+        # Must be set before _init_project_programs(), which calls
+        # _init_program_info() and reads these to populate each ProgramInfo.
+        self.skip_code_collection = skip_code_collection
+        self.decompiler_timeout = decompiler_timeout
         self.project: GhidraProject = self._get_or_create_project()
 
         self.programs: dict[str, ProgramInfo] = {}
@@ -424,6 +435,19 @@ class PyGhidraContext:
                 # XEX2 (Xbox 360) requires PowerPC:BE:64:Xenon language
                 if header.startswith(b"XEX2"):
                     return "PowerPC:BE:64:Xenon"
+                # 32-bit big-endian PowerPC ELF with an entry point in Wii MEM1
+                # (0x80000000..0x90000000) is a GameCube/Wii binary and needs
+                # PowerPC:BE:32:Gekko_Broadway for paired-single decoding.
+                if header == b"\x7fELF":
+                    f.seek(0)
+                    e_ident = f.read(16)
+                    if e_ident[4] == 1 and e_ident[5] == 2:  # 32-bit big-endian
+                        f.seek(0x12)  # e_machine
+                        e_machine = int.from_bytes(f.read(2), "big")
+                        f.seek(0x18)  # e_entry (Elf32)
+                        e_entry = int.from_bytes(f.read(4), "big")
+                        if e_machine == 20 and 0x80000000 <= e_entry < 0x90000000:
+                            return "PowerPC:BE:32:Gekko_Broadway"
         except Exception as e:
             logger.debug(f"Could not detect language for {binary_path}: {e}")
         return None
@@ -506,6 +530,7 @@ class PyGhidraContext:
             load_time=time.time(),
             code_collection=None,
             strings_collection=None,
+            decompiler_timeout=self.decompiler_timeout,
         )
 
         return program_info
@@ -534,6 +559,12 @@ class PyGhidraContext:
         Initialize Chroma code collection for a single program.
         """
         from ghidra.program.model.listing import Function
+
+        if self.skip_code_collection:
+            logger.info(
+                f"skip_code_collection set; skipping code collection for {program_info.name}"
+            )
+            return
 
         logger.info(f"Initializing Chroma code collection for {program_info.name}")
         try:

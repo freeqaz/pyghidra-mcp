@@ -588,7 +588,12 @@ class GhidraTools:
         # Cache miss - decompile
         logger.debug(f"Cache miss for {func.name}, decompiling...")
         monitor = ConsoleTaskMonitor()
-        result: DecompileResults = self.decompiler.decompileFunction(func, timeout, monitor)
+        # When no explicit timeout is passed, fall back to the program's configured
+        # decompiler timeout (0 = no timeout). Bounds build + interactive decompiles.
+        effective_timeout = timeout or getattr(self.program_info, "decompiler_timeout", 0)
+        result: DecompileResults = self.decompiler.decompileFunction(
+            func, effective_timeout, monitor
+        )
         if "" == result.getErrorMessage():
             code = result.decompiledFunction.getC()
             # Annotate PPC-specific patterns with explanatory comments
