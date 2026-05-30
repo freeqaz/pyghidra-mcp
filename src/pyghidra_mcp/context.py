@@ -756,6 +756,20 @@ class PyGhidraContext:
                 logger.info(f"Completed {completed_count}/{prog_count} programs")
 
         logger.info("All programs analyzed.")
+
+        # Persist analysis to disk SERIALLY. analyze_program already saves each program
+        # in its own worker thread (finally: project.save), but when several programs
+        # analyze concurrently those saves race on the shared GhidraProject and the
+        # on-disk programs can be left unanalyzed -> reopened as import stubs and
+        # re-analyzed on every launch. Re-saving here, back in the single
+        # _analyze_project thread, makes a multi-binary project's analysis durable.
+        for _pi in list(self.programs.values()):
+            try:
+                self.project.save(_pi.program)
+            except Exception as e:
+                logger.error(f"Failed to persist analysis for {_pi.name}: {e}")
+        logger.info("Analysis persisted to project.")
+
         # The chroma collections need to be initialized after analysis is complete
         # At this point, threaded or not, all analysis is done
         self._init_all_chroma_collections()  # DO NOT MOVE
