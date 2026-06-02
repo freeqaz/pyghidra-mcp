@@ -128,3 +128,11 @@ max-complexity = 10
 
 [tool.pyright]
 reportMissingModuleSource = false
+
+[tool.uv]
+# chromadb pulls in onnxruntime unconstrained; the resolver picks the latest
+# (1.24.x), which dropped cp310 wheels (cp311+ only). Production services run
+# --python 3.10, so fork onnxruntime by Python version exactly like chromadb
+# already forks numpy: keep the last cp310-supporting line (1.22.x) for <3.11,
+# leave newer Pythons unconstrained.
+constraint-dependencies = ["onnxruntime<1.23; python_full_version < '3.11'"]
