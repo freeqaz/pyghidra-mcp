@@ -39,10 +39,29 @@ class ProjectSpec:
                 was_gpr_path=True,
             )
 
+        # Two CLI contracts share this branch, distinguished by whether
+        # --project-name was given:
+        #
+        # * Fork style (no --project-name): the path itself encodes the project
+        #   (--project-path .../DC3/DC3). Derive the name from the basename and
+        #   keep MCP-side state (chromadb code index, symbol server) directly in
+        #   the project home. Every existing service already has a populated
+        #   {project_path}/chromadb and a {project_path}/{name}.gpr there, so
+        #   this reopens them on restart instead of spawning a fresh
+        #   "my_project" and re-analyzing + re-indexing from scratch.
+        #
+        # * Upstream style (explicit --project-name): treat --project-path as the
+        #   directory and use a dedicated {name}-pyghidra-mcp state subdir.
+        if project_name == default_project_name and project_path.name:
+            resolved_name = project_path.name
+            pyghidra_mcp_dir = project_path
+        else:
+            resolved_name = project_name
+            pyghidra_mcp_dir = project_path / f"{resolved_name}-pyghidra-mcp"
         return cls(
             project_directory=project_path,
-            project_name=project_name,
-            gpr_path=project_path / f"{project_name}.gpr",
-            pyghidra_mcp_dir=project_path / f"{project_name}-pyghidra-mcp",
+            project_name=resolved_name,
+            gpr_path=project_path / f"{resolved_name}.gpr",
+            pyghidra_mcp_dir=pyghidra_mcp_dir,
             was_gpr_path=False,
         )
