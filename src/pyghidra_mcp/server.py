@@ -22,6 +22,7 @@ import pyghidra
 from click_option_group import optgroup
 from mcp.server import Server
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from pyghidra_mcp import __version__, mcp_tools
 from pyghidra_mcp.cache_manager import CacheManager
@@ -890,6 +891,23 @@ def main(
     pyghidra_mcp_dir = project_spec.pyghidra_mcp_dir
     mcp.settings.port = port
     mcp.settings.host = host
+
+    # FastMCP auto-enables DNS-rebinding protection at construction time with an
+    # allow-list of only localhost (127.0.0.1/localhost/::1), computed from the
+    # default host before --host is parsed. That 421-rejects clients connecting
+    # via a configured hostname (e.g. ghidra.local). Recompute the allow-list
+    # from the actual --host (plus localhost, for local health checks) so the
+    # configured host is accepted while protection stays on.
+    mcp.settings.transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"{host}:*", host, "127.0.0.1:*", "localhost:*", "[::1]:*"],
+        allowed_origins=[
+            f"http://{host}:*",
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+        ],
+    )
 
     if gui:
         if transport == "stdio":
