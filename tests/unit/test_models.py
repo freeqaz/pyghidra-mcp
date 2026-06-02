@@ -13,6 +13,7 @@ from pyghidra_mcp.models import (
     ProgramBasicInfos,
     ProgramInfo,
     ProgramInfos,
+    SearchMode,
     StringInfo,
     StringSearchResult,
     StringSearchResults,
@@ -62,16 +63,16 @@ def test_program_info_model():
         load_time=1.23,
         analysis_complete=True,
         metadata={"key": "value"},
-        code_collection=True,
-        strings_collection=False,
+        code_indexed=True,
+        strings_indexed=False,
     )
     assert info.name == "test_program"
     assert info.file_path == "/path/to/program"
     assert info.load_time == 1.23
     assert info.analysis_complete is True
     assert info.metadata == {"key": "value"}
-    assert info.code_collection is True
-    assert info.strings_collection is False
+    assert info.code_indexed is True
+    assert info.strings_indexed is False
 
 
 def test_program_infos_model():
@@ -84,8 +85,8 @@ def test_program_infos_model():
                 load_time=1.23,
                 analysis_complete=True,
                 metadata={"key": "value"},
-                code_collection=True,
-                strings_collection=False,
+                code_indexed=True,
+                strings_indexed=False,
             ),
             ProgramInfo(
                 name="test_program2",
@@ -93,8 +94,8 @@ def test_program_infos_model():
                 load_time=4.56,
                 analysis_complete=False,
                 metadata={},
-                code_collection=False,
-                strings_collection=True,
+                code_indexed=False,
+                strings_indexed=True,
             ),
         ]
     )
@@ -190,6 +191,8 @@ def test_symbol_info_model():
         source="user",
         refcount=5,
         external=False,
+        is_thunk=True,
+        thunk_target="real_target @ 0x2000",
     )
     assert symbol.name == "test_symbol"
     assert symbol.address == "0x1234"
@@ -198,6 +201,8 @@ def test_symbol_info_model():
     assert symbol.source == "user"
     assert symbol.refcount == 5
     assert symbol.external is False
+    assert symbol.is_thunk is True
+    assert symbol.thunk_target == "real_target @ 0x2000"
 
 
 def test_symbol_search_results_model():
@@ -212,6 +217,7 @@ def test_symbol_search_results_model():
                 source="user",
                 refcount=5,
                 external=False,
+                is_thunk=False,
             ),
             SymbolInfo(
                 name="test_symbol2",
@@ -221,6 +227,7 @@ def test_symbol_search_results_model():
                 source="analysis",
                 refcount=1,
                 external=False,
+                is_thunk=False,
             ),
         ]
     )
@@ -235,10 +242,12 @@ def test_code_search_result_model():
         function_name="test_func",
         code="int i = 0;",
         similarity=0.9,
+        search_mode=SearchMode.SEMANTIC,
     )
     assert result.function_name == "test_func"
     assert result.code == "int i = 0;"
     assert result.similarity == 0.9
+    assert result.search_mode == SearchMode.SEMANTIC
 
 
 def test_code_search_results_model():
@@ -249,17 +258,31 @@ def test_code_search_results_model():
                 function_name="test_func1",
                 code="int i = 0;",
                 similarity=0.9,
+                search_mode=SearchMode.SEMANTIC,
             ),
             CodeSearchResult(
                 function_name="test_func2",
                 code="return 1;",
                 similarity=0.8,
+                search_mode=SearchMode.SEMANTIC,
             ),
-        ]
+        ],
+        query="test",
+        search_mode=SearchMode.SEMANTIC,
+        returned_count=2,
+        offset=0,
+        limit=10,
+        literal_total=1,
+        semantic_total=5,
+        total_functions=10,
     )
     assert len(results.results) == 2
     assert results.results[0].function_name == "test_func1"
     assert results.results[1].similarity == 0.8
+    assert results.query == "test"
+    assert results.search_mode == SearchMode.SEMANTIC
+    assert results.returned_count == 2
+    assert results.literal_total == 1
 
 
 def test_string_info_model():
@@ -300,3 +323,109 @@ def test_bytes_read_result_model():
     assert result.address == "0x1234"
     assert result.size == 4
     assert result.data == "01020304"
+
+
+def test_decompiled_function_with_error():
+    """Test DecompiledFunction with error field set."""
+    func = DecompiledFunction(name="missing_func", code="", error="Function not found")
+    assert func.name == "missing_func"
+    assert func.code == ""
+    assert func.error == "Function not found"
+    assert func.callees is None
+    assert func.referenced_strings is None
+    assert func.xrefs is None
+
+
+def test_decompiled_function_with_rich_fields():
+    """Test DecompiledFunction with callees, referenced_strings, and xrefs populated."""
+    xref = CrossReferenceInfo(
+        function_name="caller",
+        from_address="0x1000",
+        to_address="0x2000",
+        type="UNCONDITIONAL_CALL",
+    )
+    func = DecompiledFunction(
+        name="rich_func",
+        code="void rich_func() { }",
+        signature="void rich_func()",
+        callees=["helper_a", "helper_b"],
+        referenced_strings=["hello world", "error: %s"],
+        xrefs=[xref],
+    )
+    assert func.callees == ["helper_a", "helper_b"]
+    assert func.referenced_strings == ["hello world", "error: %s"]
+    assert len(func.xrefs) == 1
+    assert func.xrefs[0].function_name == "caller"
+    assert func.error is None
+
+
+def test_decompiled_function_batch_list():
+    """Test a list of DecompiledFunction results with mixed success and error."""
+    results = [
+        DecompiledFunction(
+            name="good_func", code="int good_func() { return 0; }", signature="int good_func()"
+        ),
+        DecompiledFunction(name="bad_func", code="", error="Function not found"),
+    ]
+    assert len(results) == 2
+    assert results[0].code != ""
+    assert results[0].error is None
+    assert results[1].code == ""
+    assert results[1].error == "Function not found"
+
+
+def test_cross_reference_infos_with_target():
+    """Test CrossReferenceInfos with target field."""
+    xrefs = CrossReferenceInfos(
+        target="main",
+        cross_references=[
+            CrossReferenceInfo(
+                function_name="entry",
+                from_address="0x1000",
+                to_address="0x2000",
+                type="UNCONDITIONAL_CALL",
+            ),
+        ],
+    )
+    assert xrefs.target == "main"
+    assert len(xrefs.cross_references) == 1
+    assert xrefs.error is None
+
+
+def test_cross_reference_infos_with_error():
+    """Test CrossReferenceInfos with error field and empty xrefs list."""
+    xrefs = CrossReferenceInfos(
+        target="nonexistent",
+        cross_references=[],
+        error="Symbol 'nonexistent' not found.",
+    )
+    assert xrefs.target == "nonexistent"
+    assert xrefs.cross_references == []
+    assert xrefs.error == "Symbol 'nonexistent' not found."
+
+
+def test_cross_reference_infos_batch_list():
+    """Test a list of CrossReferenceInfos results with mixed success and error."""
+    results = [
+        CrossReferenceInfos(
+            target="func_a",
+            cross_references=[
+                CrossReferenceInfo(
+                    function_name="main",
+                    from_address="0x1000",
+                    to_address="0x2000",
+                    type="UNCONDITIONAL_CALL",
+                ),
+            ],
+        ),
+        CrossReferenceInfos(
+            target="func_b",
+            cross_references=[],
+            error="Symbol 'func_b' not found.",
+        ),
+    ]
+    assert len(results) == 2
+    assert len(results[0].cross_references) == 1
+    assert results[0].error is None
+    assert results[1].cross_references == []
+    assert results[1].error is not None

@@ -7,9 +7,10 @@ from pyghidra_mcp.models import CallGraphResult
 
 
 @pytest.mark.asyncio
-async def test_gen_callgraph_tool(server_params, test_binary):
+async def test_gen_callgraph_tool(server_params, test_binary, func_prefix):
     """Test the gen_callgraph tool."""
 
+    name_two = f"{func_prefix}function_two"
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
             # Initialize the connection
@@ -22,7 +23,7 @@ async def test_gen_callgraph_tool(server_params, test_binary):
                 "gen_callgraph",
                 {
                     "binary_name": binary_name,
-                    "function_name": "function_two",
+                    "function_name": name_two,
                     "direction": "calling",
                     "display_type": "flow",
                 },
@@ -38,14 +39,11 @@ async def test_gen_callgraph_tool(server_params, test_binary):
             assert text_content is not None
             assert len(text_content) > 0
 
-            # Check that the content is valid JSON and deserializes to CallGraph
             data = text_content.strip()
             assert data.startswith("{") and data.endswith("}")
             call_graph_data = CallGraphResult.model_validate_json(data)
 
-            assert (
-                call_graph_data.function_name == "function_two"
-            )  # Assuming 'main' is always present/searched for default
+            assert name_two in call_graph_data.function_name
             assert call_graph_data.direction == "calling"
             assert call_graph_data.display_type == "flow"
             assert len(call_graph_data.graph) > 0

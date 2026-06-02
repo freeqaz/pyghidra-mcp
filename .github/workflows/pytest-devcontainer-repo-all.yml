@@ -9,16 +9,24 @@ on:
     paths:
       - 'src/pyghidra_mcp/**'
       - 'tests/**'
-      - '.github/workflows/pytest-devcontainer-all.yml'
+      - '.github/workflows/pytest-devcontainer-repo-all.yml'
   pull_request:
     branches: [ "main" ]
+    paths:
+      - 'src/pyghidra_mcp/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.python-version'
+      - 'uv.lock'
+      - '.github/workflows/pytest-devcontainer-repo-all.yml'
   schedule:
     - cron: '30 5,15 * * *'
   workflow_dispatch:
 
 jobs:
-  test:
+  test-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +54,7 @@ jobs:
         imageTag: ${{ matrix.image }}
         push: never
         runCmd: |
+          set -o pipefail
           pip install --upgrade pip
           python -m venv .venv
           source .venv/bin/activate
@@ -59,16 +68,35 @@ jobs:
           # Install your package in editable mode with dev extras
           pip install -e .[dev]
 
+          mkdir -p junit
+
           # Run tests
-          python -m pytest tests/unit/ --doctest-modules --junitxml=junit/unit-test-results-${{ matrix.image }}.xml
-          python -m pytest tests/integration/ --doctest-modules --junitxml=junit/integration-test-results-${{ matrix.image }}.xml
+          python -m pytest \
+            tests/unit/ \
+            --doctest-modules \
+            -rA \
+            -vv \
+            --durations=20 \
+            --junitxml=junit/unit-test-results-${{ matrix.image }}.xml \
+            2>&1 | tee junit/unit-test-results-${{ matrix.image }}.log
+
+          python -m pytest \
+            tests/integration/ \
+            --doctest-modules \
+            -rA \
+            -vv \
+            --durations=20 \
+            --junitxml=junit/integration-test-results-${{ matrix.image }}.xml \
+            2>&1 | tee junit/integration-test-results-${{ matrix.image }}.log
 
     - name: Upload unit test results
       if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
         name: unit-test-results-${{ matrix.image }}
-        path: junit/unit-test-results-${{ matrix.image }}.xml
+        path: |
+          junit/unit-test-results-${{ matrix.image }}.xml
+          junit/unit-test-results-${{ matrix.image }}.log
         retention-days: 7
 
     - name: Upload integration test results
@@ -76,5 +104,63 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: integration-test-results-${{ matrix.image }}
-        path: junit/integration-test-results-${{ matrix.image }}.xml
+        path: |
+          junit/integration-test-results-${{ matrix.image }}.xml
+          junit/integration-test-results-${{ matrix.image }}.log
+        retention-days: 7
+
+  test-linux-gui:
+    name: test-linux-gui (12.0ghidra3.13python-bookworm)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Overwrite original devcontainer with workflow devcontainer
+      run: cp .github/workflows/devcontainer.json .devcontainer/devcontainer.json
+
+    - name: Run GUI integration smoke tests on devcontainer
+      env:
+        DC_IMAGE_TAG: "12.0ghidra3.13python-bookworm"
+      uses: devcontainers/ci@v0.3
+      with:
+        imageName: ghcr.io/clearbluejar/ghidra-python
+        cacheFrom: ghcr.io/clearbluejar/ghidra-python
+        imageTag: ${{ env.DC_IMAGE_TAG }}
+        push: never
+        runCmd: |
+          set -o pipefail
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxtst6 libxi6 libxrender1
+
+          pip install --upgrade pip
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install -e .[dev]
+
+          command -v Xvfb
+          sudo mkdir -p /tmp/.X11-unix
+          sudo chmod 1777 /tmp/.X11-unix
+          Xvfb :99 -nolisten tcp &
+          export DISPLAY=:99
+
+          mkdir -p junit
+          python -m pytest \
+            tests/integration/test_gui_smoke.py \
+            tests/integration/test_gui_background_indexing.py \
+            -rA \
+            -vv \
+            -s \
+            --durations=10 \
+            --junitxml=junit/gui-integration-test-results.xml \
+            2>&1 | tee junit/gui-integration-test.log
+
+    - name: Upload GUI integration test results
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: gui-integration-test-results
+        path: |
+          junit/gui-integration-test-results.xml
+          junit/gui-integration-test.log
         retention-days: 7

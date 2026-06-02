@@ -13,7 +13,7 @@ from pyghidra_mcp.models import BytesReadResult
 
 
 @pytest.mark.asyncio
-async def test_read_bytes_tool(server_params):
+async def test_read_bytes_tool(server_params, base_address, is_macos):
     """Test that read_bytes works - basic smoke test."""
     async with stdio_client(server_params) as (read, write):
         async with ClientSession(read, write) as session:
@@ -21,13 +21,19 @@ async def test_read_bytes_tool(server_params):
 
             binary_name = PyGhidraContext._gen_unique_bin_name(server_params.args[-1])
 
-            # Try reading from 0x100000 (Ghidra's default ELF analysis base address)
+            # Try reading from platform-default base addresses
             response = await session.call_tool(
-                "read_bytes", {"binary_name": binary_name, "address": "100000", "size": 4}
+                "read_bytes", {"binary_name": binary_name, "address": base_address, "size": 4}
             )
 
             result = BytesReadResult.model_validate_json(response.content[0].text)
 
-            # Check if we got ELF magic bytes
-            assert result.data == "7f454c46"  # 0x7F + "ELF" in hex
+            # Check magic bytes by platform
+            if is_macos:
+                # Accept either MH_MAGIC_64 (feedfacf) or byte-swapped MH_CIGAM_64 (cffaedfe)
+                assert result.data.lower() in {"feedfacf", "cffaedfe"}
+                assert result.address == "100000000"
+            else:
+                assert result.data == "7f454c46"  # 0x7F + "ELF" in hex
+                assert result.address == "00100000"
             assert result.size == 4

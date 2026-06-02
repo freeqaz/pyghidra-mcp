@@ -214,3 +214,11 @@ tests/pyghidra_mcp_projects/**
 ghidra
 notes-*.txt
 *.code-workspace
+
+# macOS
+.DS_Store
+
+# pyghidra-mcp persistent SQLite cache (decompile + strings); written to --cache-dir
+cache.db
+cache.db-wal
+cache.db-shm

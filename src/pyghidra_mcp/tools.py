@@ -6,6 +6,7 @@ import functools
 import logging
 import re
 import typing
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -18,11 +19,13 @@ from pyghidra_mcp.models import (
     CallGraphDisplayType,
     CallGraphResult,
     CodeSearchResult,
+    CodeSearchResults,
     CrossReferenceInfo,
     DecompiledFunction,
     ExportInfo,
     FunctionInfo,
     ImportInfo,
+    SearchMode,
     StringInfo,
     StringSearchResult,
     SwitchDetectionResult,
@@ -37,6 +40,8 @@ from pyghidra_mcp.symbol_lookup import (
     extract_class_name,
     DEFAULT_MAP_FILE,
 )
+
+_REGEX_META = re.compile(r"[\\^$.|?*+(){}\[\]]")
 
 if typing.TYPE_CHECKING:
     import ghidra
@@ -204,6 +209,17 @@ def annotate_merged_calls(code: str, map_parser: Optional[MapFileParser] = None)
     return _MERGED_PATTERN.sub(replace_merged, code)
 
 
+@contextmanager
+def ghidra_transaction(program, description: str):
+    tx_id = program.startTransaction(description)
+    committed = False
+    try:
+        yield
+        committed = True
+    finally:
+        program.endTransaction(tx_id, committed)
+
+
 def handle_exceptions(func):
     """Decorator to handle exceptions in tool methods"""
 
@@ -236,29 +252,24 @@ class GhidraTools:
         """
         self.program_info = program_info
         self.program = program_info.program
-        self.decompiler = program_info.decompiler
+        self.decompiler_pool = program_info.decompiler_pool
         self.cache_manager = cache_manager
 
-        # Initialize symbol matcher for multi-strategy lookups
+        # Initialize symbol matcher for multi-strategy lookups (.map address/demangle)
         map_path = map_file or DEFAULT_MAP_FILE
         self.symbol_matcher = SymbolMatcher(map_path)
 
-        # Compute binary hash for cache lookups
-        self.binary_hash = None
-        if cache_manager and program_info.file_path:
-            try:
-                from pyghidra_mcp.cache_manager import compute_binary_hash
-                self.binary_hash = compute_binary_hash(program_info.file_path)
-            except Exception as e:
-                logger.debug(f"Could not compute binary hash: {e}")
+        # binary_hash is computed once on ProgramInfo (context._init_program_info)
+        # and reused here for the decompile cache + the SQLite strings store.
+        self.binary_hash = getattr(program_info, "binary_hash", None)
 
     def _get_filename(self, func: "Function"):
         max_path_len = 50
         return f"{func.getSymbol().getName(True)[:max_path_len]}-{func.entryPoint}"
 
-    def find_function(self, name_or_address: str) -> Optional["Function"]:
+    def _find_function_or_none(self, name_or_address: str) -> Optional["Function"]:
         """
-        Find a function using multi-strategy lookup.
+        Find a function using multi-strategy lookup (fork extension). Returns None on miss.
 
         Tries in order:
         1. Direct hex address (e.g., "0x82E4E6B8" or "82E4E6B8")
@@ -457,7 +468,7 @@ class GhidraTools:
             Ghidra Address object or None if not found
         """
         # Try finding the function first
-        func = self.find_function(name_or_address)
+        func = self._find_function_or_none(name_or_address)
         if func:
             return func.getEntryPoint()
 
@@ -471,6 +482,138 @@ class GhidraTools:
                 logger.debug(f"Address conversion failed: {e}")
 
         return None
+
+    def _resolve_function_variable(
+        self,
+        function_name_or_address: str,
+        variable_name: str,
+    ) -> tuple["Function", str, typing.Any]:
+        func = self.find_function(function_name_or_address)
+        function_name = str(func.getName())
+
+        matches: list[tuple[str, typing.Any]] = []
+        for param in func.getParameters():
+            if str(param.getName()) == variable_name:
+                matches.append(("parameter", param))
+        for local in func.getLocalVariables():
+            if str(local.getName()) == variable_name:
+                matches.append(("local", local))
+
+        if not matches:
+            raise ValueError(f"Variable '{variable_name}' not found in function '{function_name}'.")
+        if len(matches) > 1:
+            kinds = ", ".join(kind for kind, _ in matches)
+            raise ValueError(
+                f"Ambiguous variable '{variable_name}' in function '{function_name}' ({kinds})."
+            )
+
+        variable_kind, variable = matches[0]
+        return func, variable_kind, variable
+
+    def _parse_data_type(self, type_name: str):
+        from ghidra.util.data import DataTypeParser  # type: ignore
+        from ghidra.util.data.DataTypeParser import AllowedDataTypes  # type: ignore
+
+        dtm = self.program.getDataTypeManager()
+        parser = DataTypeParser(dtm, dtm, typing.cast(typing.Any, None), AllowedDataTypes.DYNAMIC)
+        return parser.parse(type_name)
+
+    def _lookup_functions(
+        self,
+        name_or_address: str,
+        *,
+        exact: bool = True,
+        partial: bool = False,
+        include_externals: bool = True,
+    ) -> list["Function"]:
+        """
+        Resolve functions by name or address.
+        Returns a flat list of unique Function objects.
+        Search modes (exact, partial) are optional and only applied if enabled.
+        """
+        af = self.program.getAddressFactory()
+        fm = self.program.getFunctionManager()
+
+        # Try interpreting as an address first
+        try:
+            addr = af.getAddress(name_or_address)
+            if addr:
+                func = fm.getFunctionAt(addr)
+                if func:
+                    return [func]
+        except Exception:
+            pass  # Not an address, fall back to name search
+
+        name_lc = name_or_address.lower()
+        functions = self.get_all_functions(include_externals=include_externals)
+        seen: set = set()
+        matches: list[Function] = []
+
+        if exact:
+            for f in functions:
+                key = f.getEntryPoint()
+                if key not in seen and name_lc == f.getSymbol().getName(True).lower():
+                    seen.add(key)
+                    matches.append(f)
+
+        if partial:
+            for f in functions:
+                key = f.getEntryPoint()
+                if key not in seen and name_lc in f.getSymbol().getName(True).lower():
+                    seen.add(key)
+                    matches.append(f)
+
+        return matches
+
+    @handle_exceptions
+    def find_function(
+        self,
+        name_or_address: str,
+        include_externals: bool = True,
+    ) -> "Function":
+        """
+        Resolve a single function by name or address. Raises if ambiguous or not found.
+
+        First uses upstream's exact name/address resolver (which raises a helpful
+        "Did you mean" error on ambiguity); if that finds nothing, falls back to the
+        fork's multi-strategy resolver (map-file address lookup, MSVC demangle,
+        method/partial matching, and CreateFunctionCmd auto-creation for map symbols
+        Ghidra never turned into functions).
+        """
+        matches = self._lookup_functions(
+            name_or_address, exact=True, partial=False, include_externals=include_externals
+        )
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            suggestions = [
+                f"{f.getSymbol().getName(True)}({f.getSignature()}) @ {f.getEntryPoint()}"
+                for f in matches
+            ]
+            raise ValueError(
+                f"Ambiguous match for '{name_or_address}'. Did you mean one of these: "
+                + ", ".join(suggestions)
+            )
+
+        func = self._find_function_or_none(name_or_address)
+        if func is not None:
+            return func
+        raise ValueError(f"Function or symbol '{name_or_address}' not found.")
+
+    @handle_exceptions
+    def find_functions(
+        self,
+        name_or_address: str,
+        include_externals: bool = True,
+    ) -> list["Function"]:
+        """
+        Return all functions that match name_or_address (exact or partial).
+        Never raises; returns empty list if none.
+        """
+        return self._lookup_functions(
+            name_or_address, exact=True, partial=True, include_externals=include_externals
+        )
 
     def _lookup_symbols(
         self,
@@ -530,10 +673,10 @@ class GhidraTools:
     @handle_exceptions
     def find_symbol(self, name_or_address: str) -> "Symbol":
         """
-        Resolve a single symbol by name or address.
+        Resolve a single symbol by name or address (exact match only).
         Raises if ambiguous or not found.
         """
-        matches = self._lookup_symbols(name_or_address, exact=True, partial=True)
+        matches = self._lookup_symbols(name_or_address, exact=True, partial=False)
 
         if len(matches) == 1:
             return matches[0]
@@ -561,9 +704,7 @@ class GhidraTools:
         - Partial/substring match
         """
         func = self.find_function(name_or_address)
-        if not func:
-            raise ValueError(f"Function {name_or_address} not found")
-        return self._decompile_function_impl(func, timeout)
+        return self.decompile_function(func, timeout=timeout)
 
     def decompile_function(self, func: "Function", timeout: int = 0) -> DecompiledFunction:
         """Decompiles a function in a specified binary and returns its pseudo-C code."""
@@ -591,22 +732,28 @@ class GhidraTools:
         # When no explicit timeout is passed, fall back to the program's configured
         # decompiler timeout (0 = no timeout). Bounds build + interactive decompiles.
         effective_timeout = timeout or getattr(self.program_info, "decompiler_timeout", 0)
-        result: DecompileResults = self.decompiler.decompileFunction(
-            func, effective_timeout, monitor
-        )
+        with self.decompiler_pool.acquire() as decompiler:
+            result: DecompileResults = decompiler.decompileFunction(
+                func, effective_timeout, monitor
+            )
         if "" == result.getErrorMessage():
-            code = result.decompiledFunction.getC()
-            # Annotate PPC-specific patterns with explanatory comments
-            code = annotate_ppc_decompilation(code)
-            # Annotate merged symbols with their actual names
-            code = annotate_merged_calls(code)
-            # Detect and annotate switch statements
-            try:
-                switches = self._detect_switches_internal(func)
-                code = annotate_switch_statements(code, switches)
-            except Exception as e:
-                logger.debug(f"Switch detection failed for {func.name}: {e}")
-            sig = result.decompiledFunction.getSignature()
+            decompiled = result.getDecompiledFunction()
+            if decompiled is None:
+                code = ""
+                sig = None
+            else:
+                code = decompiled.getC()
+                # Annotate PPC-specific patterns with explanatory comments
+                code = annotate_ppc_decompilation(code)
+                # Annotate merged symbols with their actual names
+                code = annotate_merged_calls(code)
+                # Detect and annotate switch statements
+                try:
+                    switches = self._detect_switches_internal(func)
+                    code = annotate_switch_statements(code, switches)
+                except Exception as e:
+                    logger.debug(f"Switch detection failed for {func.name}: {e}")
+                sig = decompiled.getSignature()
         else:
             code = result.getErrorMessage()
             sig = None
@@ -682,6 +829,85 @@ class GhidraTools:
 
         return strings
 
+    @staticmethod
+    def _matches_query(query: str, symbol_name: str) -> bool:
+        """Check if a symbol name matches a query (regex with substring fallback)."""
+        try:
+            return bool(re.search(query, symbol_name, re.IGNORECASE))
+        except re.error:
+            return query.lower() in symbol_name.lower()
+
+    @classmethod
+    def _symbol_matches_query(cls, query: str, symbol) -> bool:
+        """Match against both simple and namespace-qualified symbol names."""
+        names = {str(symbol.getName())}
+        try:
+            names.add(str(symbol.getName(True)))
+        except TypeError:
+            pass
+        return any(cls._matches_query(query, name) for name in names)
+
+    def _symbol_to_info(self, symbol, rm) -> SymbolInfo:
+        """Convert a Ghidra Symbol to a SymbolInfo model."""
+        ref_count = len(list(rm.getReferencesTo(symbol.getAddress())))
+        is_thunk = False
+        thunk_target = None
+
+        try:
+            func = self.program.getFunctionManager().getFunctionAt(symbol.getAddress())
+        except Exception:
+            func = None
+
+        if func is not None:
+            try:
+                is_thunk = bool(func.isThunk())
+            except Exception:
+                is_thunk = False
+
+            if is_thunk:
+                try:
+                    thunked = func.getThunkedFunction(True)
+                except TypeError:
+                    thunked = func.getThunkedFunction(False)
+                except Exception:
+                    thunked = None
+
+                if thunked is not None:
+                    thunk_target = (
+                        f"{thunked.getSymbol().getName(True)} @ {thunked.getEntryPoint()}"
+                    )
+
+        return SymbolInfo(
+            name=symbol.getName(),
+            address=str(symbol.getAddress()),
+            type=str(symbol.getSymbolType()),
+            namespace=str(symbol.getParentNamespace()),
+            source=str(symbol.getSource()),
+            refcount=ref_count,
+            external=symbol.isExternal(),
+            is_thunk=is_thunk,
+            thunk_target=thunk_target,
+        )
+
+    @classmethod
+    def _symbol_sort_key(cls, query: str, symbol, info: SymbolInfo) -> tuple:
+        names = {str(symbol.getName())}
+        try:
+            names.add(str(symbol.getName(True)))
+        except TypeError:
+            pass
+
+        query_lc = query.lower()
+        exact_name = any(name.lower() == query_lc for name in names)
+        return (
+            0 if exact_name else 1,
+            1 if info.is_thunk else 0,
+            1 if info.external else 0,
+            -info.refcount,
+            info.name.lower(),
+            info.address,
+        )
+
     @handle_exceptions
     def search_functions_by_name(
         self, query: str, offset: int = 0, limit: int = 100
@@ -738,33 +964,35 @@ class GhidraTools:
 
     @handle_exceptions
     def search_symbols_by_name(
-        self, query: str, offset: int = 0, limit: int = 100
+        self, query: str, functions_only: bool = False, offset: int = 0, limit: int = 100
     ) -> list[SymbolInfo]:
-        """Searches for symbols within a binary by name."""
+        """Searches for symbols within a binary by name (supports regex).
+
+        When functions_only=True, searches only function symbols (no labels/variables).
+        """
 
         if not query:
             raise ValueError("Query string is required")
 
-        symbols_info = []
-        symbols = self.find_symbols(query)
         rm = self.program.getReferenceManager()
+        is_regex = bool(_REGEX_META.search(query))
 
-        # Search for symbols containing the query string
-        for symbol in symbols:
-            if query.lower() in symbol.getName(True).lower():
-                ref_count = len(list(rm.getReferencesTo(symbol.getAddress())))
-                symbols_info.append(
-                    SymbolInfo(
-                        name=symbol.name,
-                        address=str(symbol.getAddress()),
-                        type=str(symbol.getSymbolType()),
-                        namespace=str(symbol.getParentNamespace()),
-                        source=str(symbol.getSource()),
-                        refcount=ref_count,
-                        external=symbol.isExternal(),
-                    )
-                )
-        return symbols_info[offset : limit + offset]
+        if functions_only:
+            sources = self.get_all_functions(True) if is_regex else self.find_functions(query)
+            symbols = (func.getSymbol() for func in sources)
+        else:
+            symbols = self.get_all_symbols(True) if is_regex else self.find_symbols(query)
+
+        matches = []
+        for sym in symbols:
+            if not self._symbol_matches_query(query, sym):
+                continue
+            info = self._symbol_to_info(sym, rm)
+            matches.append((sym, info))
+
+        matches.sort(key=lambda item: self._symbol_sort_key(query, item[0], item[1]))
+        results = [info for _, info in matches]
+        return results[offset : limit + offset]
 
     @handle_exceptions
     def list_exports(
@@ -796,7 +1024,7 @@ class GhidraTools:
         return imports[offset : limit + offset]
 
     @handle_exceptions
-    def list_cross_references(self, name_or_address: str) -> list[CrossReferenceInfo]:
+    def list_xrefs(self, name_or_address: str) -> list[CrossReferenceInfo]:
         """Finds and lists all cross-references (x-refs) to a given function, symbol,
         or address within a binary.
 
@@ -846,69 +1074,261 @@ class GhidraTools:
         return cross_references
 
     @handle_exceptions
-    def search_code(self, query: str, limit: int = 10) -> list[CodeSearchResult]:
-        """Searches the code in the binary for a given query."""
+    def get_callees(self, name_or_address: str) -> list[str]:
+        """Get names of functions called by the given function."""
+        from ghidra.util.task import ConsoleTaskMonitor
+
+        func = self.find_function(name_or_address)
+        monitor = ConsoleTaskMonitor()
+        called = func.getCalledFunctions(monitor)
+        return [f.getName() for f in called]
+
+    @handle_exceptions
+    def get_referenced_strings(self, name_or_address: str) -> list[str]:
+        """Get string literals referenced within the given function's body."""
+        from ghidra.program.model.data import AbstractStringDataType as StringDataType
+
+        func = self.find_function(name_or_address)
+        listing = self.program.getListing()
+        strings: list[str] = []
+        body = func.getBody()
+
+        for insn in listing.getInstructions(body, True):
+            for ref in insn.getReferencesFrom():
+                data = listing.getDefinedDataAt(ref.getToAddress())
+                if data is not None and isinstance(data.getDataType(), StringDataType):
+                    val = data.getValue()
+                    if val is not None:
+                        strings.append(str(val))
+
+        return strings
+
+    def _search_code_literal(
+        self,
+        literal_results: typing.Any,
+        limit: int,
+        offset: int,
+        include_full_code: bool,
+        preview_length: int,
+    ) -> list[CodeSearchResult]:
+        search_results: list[CodeSearchResult] = []
+        if literal_results and literal_results.get("documents"):
+            # Apply offset and limit
+            docs = literal_results["documents"] or []
+            metadatas = literal_results["metadatas"] or []
+
+            # Paginate
+            start_idx = offset
+            end_idx = offset + limit
+            paginated_docs = docs[start_idx:end_idx]
+            paginated_meta = metadatas[start_idx:end_idx] if metadatas else []
+
+            for i, doc in enumerate(paginated_docs):
+                metadata = paginated_meta[i] if i < len(paginated_meta) else {}
+                code = doc
+                preview = None
+
+                if not include_full_code:
+                    preview = code[:preview_length] + "..." if len(code) > preview_length else code
+                    code = preview
+
+                search_results.append(
+                    CodeSearchResult(
+                        function_name=str(
+                            metadata.get("function_name", "unknown")
+                            if isinstance(metadata, dict)
+                            else "unknown"
+                        ),
+                        code=code,
+                        similarity=1.0,  # Exact match
+                        search_mode=SearchMode.LITERAL,
+                        preview=preview,
+                    )
+                )
+        return search_results
+
+    def _search_code_semantic(
+        self,
+        query: str,
+        limit: int,
+        offset: int,
+        similarity_threshold: float,
+        include_full_code: bool,
+        preview_length: int,
+        total_functions: int,  # Added total_functions to correctly calculate semantic_total
+    ) -> tuple[list[CodeSearchResult], int]:  # Changed return type to int for semantic_total
+        assert self.program_info.code_collection is not None
+        search_results: list[CodeSearchResult] = []
+        # Semantic search
+        results = self.program_info.code_collection.query(
+            query_texts=[query],
+            n_results=limit + offset,
+        )
+
+        docs_list = results.get("documents") if results else None
+        semantic_total = total_functions  # Initialize semantic_total here
+
+        if results and docs_list and len(docs_list) > 0 and docs_list[0]:
+            # Apply offset
+            docs = docs_list[0][offset:]
+            metadatas_list = results.get("metadatas")
+            distances_list = results.get("distances")
+            metadatas = (
+                metadatas_list[0][offset:] if metadatas_list and len(metadatas_list) > 0 else []
+            )
+            distances = (
+                distances_list[0][offset:] if distances_list and len(distances_list) > 0 else []
+            )
+
+            for i, doc in enumerate(docs):
+                metadata = metadatas[i] if i < len(metadatas) else {}
+                distance = distances[i] if i < len(distances) else 0
+                # ChromaDB uses L2 distance by default (0 = identical, can be > 1)
+                # Normalize to 0-1 range where 1 = identical
+                similarity = 1 / (1 + distance)
+
+                # Skip results below similarity threshold
+                if similarity < similarity_threshold:
+                    continue
+
+                code = doc
+                preview = None
+
+                if not include_full_code:
+                    preview = code[:preview_length] + "..." if len(code) > preview_length else code
+                    code = preview
+
+                search_results.append(
+                    CodeSearchResult(
+                        function_name=str(
+                            metadata.get("function_name", "unknown")
+                            if isinstance(metadata, dict)
+                            else "unknown"
+                        ),
+                        code=code,
+                        similarity=similarity,
+                        search_mode=SearchMode.SEMANTIC,
+                        preview=preview,
+                    )
+                )
+
+            # Refine semantic_total
+            # If we got fewer results than requested limit (after filtering),
+            # providing we fetched enough (n_results was limit+offset)
+            # and we processed strictly what we asked for.
+            # Actually, if the RAW result count was less than n_results, we know we exhausted
+            # the DB.
+            # If valid_results_count < limit, we *might* have exhausted matches above threshold
+            # in this batch.
+            # A better heuristic: if result count < limit, we found everything.
+            if len(search_results) < limit:
+                # This is only accurate if we assume we found "the end".
+                # However, since we queried limit + offset, if we got less than limit (and we
+                # started at offset),
+                # it implies we are at the tail.
+                semantic_total = offset + len(search_results)
+
+        return search_results, semantic_total
+
+    @handle_exceptions
+    def search_code(
+        self,
+        query: str,
+        limit: int = 10,
+        offset: int = 0,
+        search_mode: SearchMode = SearchMode.SEMANTIC,
+        include_full_code: bool = True,
+        preview_length: int = 500,
+        similarity_threshold: float = 0.0,
+    ) -> CodeSearchResults:
+        """
+        Searches the code in the binary for a given query.
+
+        Supports semantic (vector similarity) and literal (exact match) modes.
+        Always returns dual-mode counts to help LLM decide on mode switching.
+
+        Args:
+            similarity_threshold: Minimum similarity score (0.0-1.0) for semantic results.
+                                  Results below this threshold are filtered out.
+        """
         if not self.program_info.code_collection:
             raise ValueError(
                 "Code indexing is not complete for this binary. Please try again later."
             )
 
-        results = self.program_info.code_collection.query(query_texts=[query], n_results=limit)
-        search_results = []
-        if results and results["documents"]:
-            for i, doc in enumerate(results["documents"][0]):
-                metadata = results["metadatas"][0][i]  # type: ignore
-                distance = results["distances"][0][i]  # type: ignore
-                search_results.append(
-                    CodeSearchResult(
-                        function_name=str(metadata["function_name"]),
-                        code=doc,
-                        similarity=1 - distance,
-                    )
-                )
-        return search_results
+        # ALWAYS get literal count (reuse for literal mode search)
+        literal_results = self.program_info.code_collection.get(where_document={"$contains": query})
+        literal_total = (
+            len(literal_results["ids"]) if literal_results and literal_results.get("ids") else 0
+        )
+
+        # Total functions in collection (absolute total)
+        total_functions = self.program_info.code_collection.count()
+
+        # Default semantic total to "available" (filtered by limit)
+        # If we filter and get FEWER than requested, we effectively found "all" above threshold
+        # in this range.
+        # But we don't know beyond the limit.
+        # So we default to total_functions as "estimated matches" if we hit the limit.
+        semantic_total = total_functions
+
+        search_results: list[CodeSearchResult] = []
+
+        if search_mode == SearchMode.LITERAL:
+            search_results = self._search_code_literal(
+                literal_results, limit, offset, include_full_code, preview_length
+            )
+        else:
+            search_results, estimated_total = self._search_code_semantic(
+                query,
+                limit,
+                offset,
+                similarity_threshold,
+                include_full_code,
+                preview_length,
+                total_functions,
+            )
+            if estimated_total is not None:
+                semantic_total = estimated_total
+
+        return CodeSearchResults(
+            results=search_results,
+            query=query,
+            search_mode=search_mode,
+            returned_count=len(search_results),
+            offset=offset,
+            limit=limit,
+            literal_total=literal_total,
+            semantic_total=semantic_total,
+            total_functions=total_functions,
+        )
 
     @handle_exceptions
     def search_strings(self, query: str, limit: int = 100) -> list[StringSearchResult]:
-        """Searches for strings within a binary."""
+        """Searches for strings within a binary using substring matching."""
 
-        if not self.program_info.strings_collection:
+        if self.program_info.strings is None:
             raise ValueError(
                 "String indexing is not complete for this binary. Please try again later."
             )
 
-        search_results = []
-        results = self.program_info.strings_collection.get(
-            where_document={"$contains": query}, limit=limit
-        )
-        if results and results["documents"]:
-            for i, doc in enumerate(results["documents"]):
-                metadata = results["metadatas"][i]  # type: ignore
-                search_results.append(
-                    StringSearchResult(
-                        value=doc,
-                        address=str(metadata["address"]),
-                        similarity=1,
-                    )
+        # Persistent SQLite strings store (shared across instances via --cache-dir)
+        # takes priority. Strings are extracted once per binary_hash at index time.
+        if self.cache_manager is not None and self.cache_manager.enabled and self.binary_hash:
+            return [
+                StringSearchResult(value=value, address=address, similarity=1.0)
+                for address, value in self.cache_manager.search_strings(
+                    self.binary_hash, query, limit
                 )
-            limit -= len(results["documents"])
+            ]
 
-        if limit <= 0:
-            return search_results
-        results = self.program_info.strings_collection.query(query_texts=[query], n_results=limit)
-        if results and results["documents"]:
-            for i, doc in enumerate(results["documents"][0]):
-                metadata = results["metadatas"][0][i]  # type: ignore
-                distance = results["distances"][0][i]  # type: ignore
-                search_results.append(
-                    StringSearchResult(
-                        value=doc,
-                        address=str(metadata["address"]),
-                        similarity=1 - distance,
-                    )
-                )
-
-        return search_results
+        # Fallback: in-memory list (no --cache-dir configured, e.g. GUI mode).
+        query_lower = query.lower()
+        return [
+            StringSearchResult(value=s.value, address=s.address, similarity=1.0)
+            for s in self.program_info.strings
+            if query_lower in s.value.lower()
+        ][:limit]
 
     @handle_exceptions
     def read_bytes(self, address: str, size: int = 32) -> BytesReadResult:
@@ -1185,7 +1605,8 @@ class GhidraTools:
 
         for i, func in enumerate(all_funcs):
             try:
-                result = self.decompiler.decompileFunction(func, timeout_per_func, monitor)
+                with self.decompiler_pool.acquire() as decompiler:
+                    result = decompiler.decompileFunction(func, timeout_per_func, monitor)
                 if result.getErrorMessage() != "":
                     errors += 1
                     continue
@@ -1807,3 +2228,226 @@ class GhidraTools:
             self.program.endTransaction(txn, False)
             logger.error(f"Apply demangled signatures transaction failed: {e}")
             raise
+
+    def rename_function(self, name_or_address: str, new_name: str) -> dict:
+        from ghidra.program.model.symbol import SourceType
+
+        func = self.find_function(name_or_address)
+        old_name = str(func.getName())
+        address = str(func.getEntryPoint())
+
+        with ghidra_transaction(
+            self.program,
+            f"pyghidra-mcp: rename {old_name} -> {new_name}",
+        ):
+            func.setName(new_name, SourceType.USER_DEFINED)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "address": address,
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+
+    @handle_exceptions
+    def rename_variable(
+        self,
+        function_name_or_address: str,
+        variable_name: str,
+        new_name: str,
+    ) -> dict:
+        from ghidra.program.model.symbol import SourceType
+
+        func, variable_kind, variable = self._resolve_function_variable(
+            function_name_or_address, variable_name
+        )
+        old_name = str(variable_name)
+        function_name = str(func.getName())
+        function_address = str(func.getEntryPoint())
+        with ghidra_transaction(
+            self.program,
+            f"pyghidra-mcp: rename {variable_kind} {old_name} -> {new_name}",
+        ):
+            variable.setName(new_name, SourceType.USER_DEFINED)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "function_name": function_name,
+            "function_address": function_address,
+            "variable_kind": variable_kind,
+            "old_name": old_name,
+            "new_name": new_name,
+        }
+
+    @handle_exceptions
+    def set_variable_type(
+        self,
+        function_name_or_address: str,
+        variable_name: str,
+        type_name: str,
+    ) -> dict:
+        from ghidra.program.model.symbol import SourceType
+
+        func, variable_kind, variable = self._resolve_function_variable(
+            function_name_or_address, variable_name
+        )
+        function_name = str(func.getName())
+        function_address = str(func.getEntryPoint())
+        old_type = str(variable.getDataType().getDisplayName())
+        data_type = self._parse_data_type(type_name)
+
+        with ghidra_transaction(
+            self.program,
+            f"pyghidra-mcp: set {variable_kind} type {variable_name} -> {type_name}",
+        ):
+            variable.setDataType(data_type, SourceType.USER_DEFINED)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "function_name": function_name,
+            "function_address": function_address,
+            "variable_kind": variable_kind,
+            "variable_name": str(variable.getName()),
+            "old_type": old_type,
+            "new_type": str(variable.getDataType().getDisplayName()),
+        }
+
+    @handle_exceptions
+    def set_function_prototype(
+        self,
+        function_name_or_address: str,
+        prototype: str,
+    ) -> dict:
+        from ghidra.app.cmd.function import ApplyFunctionSignatureCmd
+        from ghidra.app.util.parser import FunctionSignatureParser
+        from ghidra.program.model.symbol import SourceType
+        from ghidra.util.task import TaskMonitor
+
+        func = self.find_function(function_name_or_address)
+        function_name = str(func.getName())
+        function_address = str(func.getEntryPoint())
+        old_prototype = str(func.getSignature())
+
+        parser = FunctionSignatureParser(
+            self.program.getDataTypeManager(), typing.cast(typing.Any, None)
+        )
+        parsed_signature = parser.parse(func.getSignature(False), prototype)
+        cmd = ApplyFunctionSignatureCmd(
+            func.getEntryPoint(),
+            parsed_signature,
+            SourceType.USER_DEFINED,
+        )
+
+        with ghidra_transaction(
+            self.program,
+            f"pyghidra-mcp: set function prototype {function_name}",
+        ):
+            if not cmd.applyTo(self.program, TaskMonitor.DUMMY):
+                message = cmd.getStatusMsg() or f"Failed to apply function prototype: {prototype}"
+                raise ValueError(message)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "function_name": function_name,
+            "function_address": function_address,
+            "old_prototype": old_prototype,
+            "new_prototype": str(func.getSignature()),
+        }
+
+    @handle_exceptions
+    def set_comment(self, target: str, comment: str, comment_type: str) -> dict:
+        try:
+            from ghidra.program.model.listing import CommentType
+
+            listing_comment_types = {
+                "plate": CommentType.PLATE,
+                "pre": CommentType.PRE,
+                "eol": CommentType.EOL,
+                "post": CommentType.POST,
+                "repeatable": CommentType.REPEATABLE,
+            }
+        except ImportError:
+            from ghidra.program.model.listing import CodeUnit
+
+            listing_comment_types = {
+                "plate": CodeUnit.PLATE_COMMENT,
+                "pre": CodeUnit.PRE_COMMENT,
+                "eol": CodeUnit.EOL_COMMENT,
+                "post": CodeUnit.POST_COMMENT,
+                "repeatable": CodeUnit.REPEATABLE_COMMENT,
+            }
+
+        normalized_type = comment_type.lower()
+        if normalized_type == "decompiler":
+            func = self.find_function(target)
+            addr = func.getEntryPoint()
+
+            with ghidra_transaction(
+                self.program,
+                f"pyghidra-mcp: set function comment @ {addr}",
+            ):
+                func.setComment(comment)
+
+            self.invalidate_decompiler_cache()
+            return {
+                "address": str(addr),
+                "comment": comment,
+                "comment_type": "decompiler",
+            }
+
+        ghidra_comment_type = listing_comment_types.get(normalized_type)
+        if ghidra_comment_type is None:
+            allowed = ["decompiler", *listing_comment_types.keys()]
+            raise ValueError(f"Invalid comment_type '{comment_type}'. Expected one of: {allowed}")
+
+        addr = self._resolve_comment_target_address(target)
+        with ghidra_transaction(
+            self.program,
+            f"pyghidra-mcp: set {normalized_type} comment @ {addr}",
+        ):
+            self.program.getListing().setComment(addr, ghidra_comment_type, comment)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "address": str(addr),
+            "comment": comment,
+            "comment_type": normalized_type,
+        }
+
+    def invalidate_decompiler_cache(self) -> None:
+        try:
+            self.decompiler_pool.invalidate_all()
+        except Exception:
+            logger.debug("Failed to invalidate decompiler cache", exc_info=True)
+
+    def _parse_address(self, address: str):
+        addr_str = address[2:] if address.lower().startswith("0x") else address
+        addr = self.program.getAddressFactory().getAddress(addr_str)
+        if addr is None:
+            raise ValueError(f"Invalid address: {address}")
+        return addr
+
+    def _resolve_comment_target_address(self, target: str):
+        try:
+            return self._parse_address(target)
+        except Exception:
+            pass
+
+        if target.isdigit():
+            addr = self.program.getAddressFactory().getDefaultAddressSpace().getAddress(int(target))
+            if addr is not None:
+                return addr
+
+        try:
+            return self.find_symbol(target).getAddress()
+        except Exception:
+            pass
+
+        try:
+            return self.find_function(target).getEntryPoint()
+        except Exception:
+            pass
+
+        raise ValueError(
+            f"Could not resolve comment target '{target}' as an address, symbol, or function."
+        )

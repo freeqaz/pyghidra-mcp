@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client
@@ -6,7 +8,7 @@ from pyghidra_mcp.context import PyGhidraContext
 
 
 @pytest.mark.asyncio
-async def test_decompile_function_tool(server_params, test_binary):
+async def test_decompile_function_tool(server_params, test_binary, main_func_name):
     """Test the decompile_function tool."""
 
     async with stdio_client(server_params) as (read, write):
@@ -14,27 +16,78 @@ async def test_decompile_function_tool(server_params, test_binary):
             # Initialize the connection
             await session.initialize()
 
-            # Call the decompile_function tool
-            try:
-                binary_name = PyGhidraContext._gen_unique_bin_name(server_params.args[-1])
-                results = await session.call_tool(
-                    "decompile_function", {"binary_name": binary_name, "name_or_address": "main"}
-                )
+            binary_name = PyGhidraContext._gen_unique_bin_name(server_params.args[-1])
+            results = await session.call_tool(
+                "decompile_function",
+                {"binary_name": binary_name, "name_or_address": main_func_name},
+            )
 
-                # Check that we got results
-                assert results is not None
-                assert results.content is not None
-                assert len(results.content) > 0
+            assert results is not None
+            assert results.content is not None
+            assert len(results.content) > 0
 
-                # Check that the result contains decompiled code
-                # (this might vary depending on the binary and Ghidra's analysis)
-                # We'll just check that it's not empty
-                text_content = results.content[0].text
-                assert text_content is not None
-                assert len(text_content) > 0
-                assert "main" in text_content
-            except Exception as e:
-                # If we get an error, it might be because the function wasn't found
-                # or because of issues with the binary analysis
-                # We'll just check that we got a proper error response
-                assert e is not None
+            text_content = results.content[0].text
+            assert text_content is not None
+            result_dict = json.loads(text_content)
+            assert isinstance(result_dict, dict)
+            assert result_dict["code"] != ""
+            assert main_func_name in result_dict["name"]
+
+
+@pytest.mark.asyncio
+async def test_decompile_function_rich_response(server_params, test_binary, main_func_name):
+    """Test decompile_function with include_callees and include_xrefs flags."""
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            binary_name = PyGhidraContext._gen_unique_bin_name(server_params.args[-1])
+
+            results = await session.call_tool(
+                "decompile_function",
+                {
+                    "binary_name": binary_name,
+                    "name_or_address": main_func_name,
+                    "include_callees": True,
+                    "include_xrefs": True,
+                },
+            )
+
+            assert len(results.content) >= 1
+            result_dict = json.loads(results.content[0].text)
+            assert isinstance(result_dict, dict)
+            assert "callees" in result_dict
+            assert isinstance(result_dict["callees"], list)
+            assert "xrefs" in result_dict
+            assert isinstance(result_dict["xrefs"], list)
+
+
+@pytest.mark.asyncio
+async def test_decompile_function_batch(server_params, test_binary, func_prefix):
+    """Test decompile_function with batch targets (list of names)."""
+    name_one = f"{func_prefix}function_one"
+
+    async with stdio_client(server_params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            binary_name = PyGhidraContext._gen_unique_bin_name(server_params.args[-1])
+
+            results = await session.call_tool(
+                "decompile_function",
+                {
+                    "binary_name": binary_name,
+                    "name_or_address": [name_one, "nonexistent_function_xyz"],
+                },
+            )
+
+            # Batch returns one content block per item
+            assert len(results.content) >= 2
+            success = json.loads(results.content[0].text)
+            failure = json.loads(results.content[1].text)
+
+            assert success["code"] != ""
+            assert success.get("error") is None
+
+            assert failure["code"] == ""
+            assert failure["error"] is not None
+            assert "not found" in failure["error"].lower()

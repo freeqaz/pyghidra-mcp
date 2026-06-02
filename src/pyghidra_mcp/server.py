@@ -7,6 +7,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -20,33 +21,15 @@ import click
 import pyghidra
 from click_option_group import optgroup
 from mcp.server import Server
-from mcp.server.fastmcp import Context, FastMCP
-from mcp.shared.exceptions import McpError
-from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
+from mcp.server.fastmcp import FastMCP
 
-from pyghidra_mcp.__init__ import __version__
+from pyghidra_mcp import __version__, mcp_tools
 from pyghidra_mcp.cache_manager import CacheManager
 from pyghidra_mcp.context import PyGhidraContext
-from pyghidra_mcp.models import (
-    BinaryMetadata,
-    BytesReadResult,
-    CallGraphDirection,
-    CallGraphDisplayType,
-    CallGraphResult,
-    CodeSearchResults,
-    CrossReferenceInfos,
-    DecompiledFunction,
-    ExportInfos,
-    FunctionSearchResults,
-    ImportInfos,
-    ProgramInfo,
-    ProgramInfos,
-    StringSearchResults,
-    StructureInfo,
-    StructureListResult,
-    SymbolSearchResults,
-)
-from pyghidra_mcp.tools import GhidraTools
+from pyghidra_mcp.context_protocol import MCPContext
+from pyghidra_mcp.gui_context import GuiPyGhidraContext
+from pyghidra_mcp.gui_launcher import GuiPyGhidraMcpLauncher, ensure_macos_framework_python
+from pyghidra_mcp.project_spec import DEFAULT_PROJECT_NAME, ProjectSpec
 
 # Setup logging with both console and file output
 def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
@@ -84,14 +67,11 @@ def setup_logging(log_file: Optional[str] = None) -> logging.Logger:
 # Initialize logger (will be reconfigured with log file in main())
 logger = setup_logging()
 
-# Service start time for uptime tracking
-SERVICE_START_TIME = time.time()
-
 
 # Init Pyghidra
 # ---------------------------------------------------------------------------------
 @asynccontextmanager
-async def server_lifespan(server: Server) -> AsyncIterator[PyGhidraContext]:
+async def server_lifespan(server: Server) -> AsyncIterator[MCPContext]:
     """Manage server startup and shutdown lifecycle."""
     try:
         yield server._pyghidra_context  # type: ignore
@@ -220,707 +200,50 @@ def diagnose() -> None:
     print("\n" + "=" * 70)
 
 
-# MCP Tools
-# ---------------------------------------------------------------------------------
-@mcp.tool()
-def get_service_health(ctx: Context) -> dict:
-    """Returns health status of the Ghidra service.
-
-    This endpoint can be called to verify the service is running and responsive.
-    Returns uptime, version, and Ghidra readiness status.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        uptime_seconds = int(time.time() - SERVICE_START_TIME)
-        ghidra_ready = (
-            len(pyghidra_context.programs) > 0
-            if pyghidra_context else False
-        )
-
-        return {
-            "status": "healthy",
-            "version": __version__,
-            "uptime_seconds": uptime_seconds,
-            "ghidra_ready": ghidra_ready,
-            "programs_loaded": len(pyghidra_context.programs) if pyghidra_context else 0,
-        }
-    except Exception as e:
-        logger.error(f"Health check error: {e}")
-        return {
-            "status": "error",
-            "version": __version__,
-            "error": str(e),
-        }
-
-
-@mcp.tool()
-def search_functions_by_name(
-    binary_name: str, query: str, ctx: Context, offset: int = 0, limit: int = 100
-) -> FunctionSearchResults:
-    """Searches for functions within a binary by name.
-
-    This is a dedicated function search that finds functions with names containing
-    the query string. For broader symbol searches (including labels, variables, etc.),
-    use search_symbols_by_name instead.
-
-    Args:
-        binary_name: The name of the binary to search within.
-        query: The substring to search for in function names (case-insensitive).
-        offset: The number of results to skip.
-        limit: The maximum number of results to return.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        functions = tools.search_functions_by_name(query, offset, limit)
-        return FunctionSearchResults(functions=functions)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error searching for functions: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-async def decompile_function(
-    binary_name: str, name_or_address: str, ctx: Context
-) -> DecompiledFunction:
-    """Decompiles a function in a specified binary and returns its pseudo-C code.
-
-    Args:
-        binary_name: The name of the binary containing the function.
-        name_or_address: The name or address of the function to decompile.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        cache_manager = getattr(mcp, '_cache_manager', None)
-        tools = GhidraTools(program_info, cache_manager=cache_manager)
-        return tools.decompile_function_by_name_or_addr(name_or_address)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error decompiling function: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def get_cache_stats(ctx: Context) -> dict:
-    """Returns decompilation cache statistics.
-
-    Returns cache hit count, entry count, hit rate, and cache size.
-    Useful for diagnostics and understanding cache performance.
-    """
-    try:
-        cache_manager = getattr(mcp, '_cache_manager', None)
-        if not cache_manager:
-            return {
-                "enabled": False,
-                "message": "Cache not initialized",
-            }
-        return cache_manager.get_stats()
-    except Exception as e:
-        logger.error(f"Error getting cache stats: {e}")
-        return {
-            "error": str(e),
-        }
-
-
-@mcp.tool()
-def search_symbols_by_name(
-    binary_name: str, query: str, ctx: Context, offset: int = 0, limit: int = 25
-) -> SymbolSearchResults:
-    """Searches for symbols, including functions, within a binary by name.
-
-    This tool searches for symbols by a case-insensitive substring. Symbols include
-    Functions, Labels, Classes, Namespaces, Externals, Dynamics, Libraries,
-    Global Variables, Parameters, and Local Variables.
-
-    Args:
-        binary_name: The name of the binary to search within.
-        query: The substring to search for in symbol names (case-insensitive).
-        offset: The number of results to skip.
-        limit: The maximum number of results to return.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        symbols = tools.search_symbols_by_name(query, offset, limit)
-        return SymbolSearchResults(symbols=symbols)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error searching for symbols: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def search_code(binary_name: str, query: str, ctx: Context, limit: int = 5) -> CodeSearchResults:
-    """
-    Perform a semantic code search over a binarys decompiled pseudo C output
-    powered by a vector database for similarity matching.
-
-    This returns the most relevant functions or code blocks whose semantics
-    match the provided query even if the exact text differs. Results are
-    Ghidra generated pseudo C enabling natural language like exploration of
-    binary code structure.
-
-    For best results provide a short distinctive query such as a function
-    signature or key logic snippet to minimize irrelevant matches.
-
-    Args:
-        binary_name: Name of the binary to search within.
-        query: Code snippet signature or description to match via semantic search.
-        limit: Maximum number of top scoring results to return (default: 5).
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        results = tools.search_code(query, limit)
-        return CodeSearchResults(results=results)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error searching for code: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def list_project_binaries(ctx: Context) -> ProgramInfos:
-    """
-    Retrieve binary name, path, and analysis status for every program (binary) currently
-    loaded in the active project.
-
-    Returns a structured list of program entries, each containing:
-    - name: The display name of the program
-    - file_path: Absolute path to the binary file on disk (if available)
-    - load_time: Timestamp when the program was loaded into the project
-    - analysis_complete: Boolean indicating if automated analysis has finished
-
-    Use this to inspect the full set of binaries in the project, monitor analysis
-    progress, or drive follow up actions such as listing imports/exports or running
-    code searches on specific programs.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_infos = []
-        for name, pi in pyghidra_context.programs.items():
-            program_infos.append(
-                ProgramInfo(
-                    name=name,
-                    file_path=str(pi.file_path) if pi.file_path else None,
-                    load_time=pi.load_time,
-                    analysis_complete=pi.analysis_complete,
-                    metadata={},
-                    code_collection=pi.code_collection is not None,
-                    strings_collection=pi.strings_collection is not None,
-                )
-            )
-        return ProgramInfos(programs=program_infos)
-    except Exception as e:
-        raise McpError(
-            ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Error listing project program info: {e!s}",
-            )
-        ) from e
-
-
-@mcp.tool()
-def list_project_binary_metadata(binary_name: str, ctx: Context) -> BinaryMetadata:
-    """
-    Retrieve detailed metadata for a specific program (binary) in the active project.
-
-    This tool provides extensive information about a binary, including its architecture,
-    compiler, executable format, and various analysis metrics like the number of
-    functions and symbols. It is useful for gaining a deep understanding of a
-    binary's composition and properties. For example, you can use it to determine
-    the processor (`Processor`), endianness (`Endian`), or check if it's a
-    relocatable file (`Relocatable`). The results also include hashes like MD5/SHA256
-    and details from the executable format (e.g., ELF or PE).
-
-    Args:
-        binary_name: The name of the binary to retrieve metadata for.
-
-    Returns:
-        An object containing detailed metadata for the specified binary.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        metadata_dict = program_info.metadata
-        return BinaryMetadata.model_validate(metadata_dict)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(
-                code=INTERNAL_ERROR,
-                message=f"Error retrieving binary metadata: {e!s}",
-            )
-        ) from e
-
-
-@mcp.tool()
-async def delete_project_binary(binary_name: str, ctx: Context) -> str:
-    """Deletes a binary (program) from the project.
-
-    Args:
-        binary_name: The name of the binary to delete.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        if pyghidra_context.delete_program(binary_name):
-            return f"Successfully deleted binary: {binary_name}"
-        else:
-            raise McpError(
-                ErrorData(
-                    code=INVALID_PARAMS,
-                    message=f"Binary '{binary_name}' not found or could not be deleted.",
-                )
-            )
-    except Exception as e:
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error deleting binary: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def list_exports(
-    binary_name: str,
-    ctx: Context,
-    query: str = ".*",
-    offset: int = 0,
-    limit: int = 25,
-) -> ExportInfos:
-    """
-    Retrieve exported functions and symbols from a given binary,
-    with optional regex filtering to focus on only the most relevant items.
-
-    For large binaries, using the `query` parameter is strongly recommended
-    to reduce noise and improve downstream reasoning. Specify a substring
-    or regex to match export names. For example: `query="init"`
-    to list only initialization-related exports.
-
-    Args:
-        binary_name: Name of the binary to inspect.
-        query: Strongly recommended. Regex pattern to match specific
-               export names. Use to limit irrelevant results and narrow
-               context for analysis.
-        offset: Number of matching results to skip (for pagination).
-        limit: Maximum number of results to return.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        exports = tools.list_exports(query=query, offset=offset, limit=limit)
-        return ExportInfos(exports=exports)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error listing exports: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def list_imports(
-    binary_name: str,
-    ctx: Context,
-    query: str = ".*",
-    offset: int = 0,
-    limit: int = 25,
-) -> ImportInfos:
-    """
-    Retrieve imported functions and symbols from a given binary,
-    with optional filtering to return only the most relevant matches.
-
-    This tool is most effective when you use the `query` parameter to
-    focus results — especially for large binaries — by specifying a
-    substring or regex that matches the desired import names.
-    For example: `query="socket"` to only see socket-related imports.
-
-    Args:
-        binary_name: Name of the binary to inspect.
-        query: Strongly recommended. Regex pattern to match specific
-               import names. Use to reduce irrelevant results and narrow
-               context for downstream reasoning.
-        offset: Number of matching results to skip (for pagination).
-        limit: Maximum number of results to return.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        imports = tools.list_imports(query=query, offset=offset, limit=limit)
-        return ImportInfos(imports=imports)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error listing imports: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def list_cross_references(
-    binary_name: str, name_or_address: str, ctx: Context
-) -> CrossReferenceInfos:
-    """Finds and lists all cross-references (x-refs) to a given function, symbol, or address within
-    a binary. This is crucial for understanding how code and data are used and related.
-    If an exact match for a function or symbol is not found,
-    the error message will suggest other symbols that are close matches.
-
-    Args:
-        binary_name: The name of the binary to search for cross-references in.
-        name_or_address: The name of the function, symbol, or a specific address (e.g., '0x1004010')
-        to find cross-references to.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        cross_references = tools.list_cross_references(name_or_address)
-        return CrossReferenceInfos(cross_references=cross_references)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error listing cross-references: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def search_strings(
-    binary_name: str,
-    ctx: Context,
-    query: str,
-    limit: int = 100,
-) -> StringSearchResults:
-    """Searches for strings within a binary by name.
-    This can be very useful to gain general understanding of behaviors.
-
-    Args:
-        binary_name: The name of the binary to search within.
-        query: A query to filter strings by.
-        limit: The maximum number of results to return.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        strings = tools.search_strings(query=query, limit=limit)
-        return StringSearchResults(strings=strings)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error searching for strings: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def read_bytes(binary_name: str, ctx: Context, address: str, size: int = 32) -> BytesReadResult:
-    """Reads raw bytes from memory at a specified address.
-
-    Args:
-        binary_name: The name of the binary to read bytes from.
-        address: The memory address to read from (supports hex format with or without 0x prefix).
-        size: The number of bytes to read (default: 32, max: 8192).
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        return tools.read_bytes(address=address, size=size)
-    except ValueError as e:
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-    except Exception as e:
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Error reading bytes: {e!s}")) from e
-
-
-@mcp.tool()
-def list_structures(
-    binary_name: str,
-    ctx: Context,
-    query: str = ".*",
-    offset: int = 0,
-    limit: int = 100,
-) -> StructureListResult:
-    """List structure/class data types from Ghidra's Data Type Manager.
-
-    Returns structure layouts including member names, types, offsets, and sizes.
-    Use query to filter by name (regex). Paginate with offset/limit.
-
-    Args:
-        binary_name: The name of the binary to inspect.
-        query: Regex pattern to filter structure names (case-insensitive).
-        offset: Number of results to skip (for pagination).
-        limit: Maximum number of results to return.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        structures, total = tools.get_structures(query, offset, limit)
-        return StructureListResult(
-            structures=[StructureInfo(**s) for s in structures],
-            total_count=total,
-        )
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error listing structures: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def extract_structures(
-    binary_name: str,
-    ctx: Context,
-    max_functions: int = 0,
-    timeout_per_func: int = 30,
-) -> dict:
-    """Extract structure types by batch-decompiling functions.
-
-    Ghidra's DTM is empty after headless analysis. This tool decompiles functions
-    to trigger the decompiler's type inference, then collects any Structure types
-    it discovers from local/global variables and parameters.
-
-    This is a long-running operation (minutes to hours for large binaries).
-    Use max_functions to limit scope for testing.
-
-    Args:
-        binary_name: The name of the binary to analyze.
-        max_functions: Max functions to decompile (0 = all).
-        timeout_per_func: Decompiler timeout per function in seconds.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        structures, stats = tools.extract_structures(max_functions, timeout_per_func)
-        return {
-            "structures": structures,
-            "total_count": len(structures),
-            "stats": stats,
-        }
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error extracting structures: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def create_structures(
-    binary_name: str,
-    class_defs: list[dict],
-    ctx: Context,
-) -> dict:
-    """Create structure data types in Ghidra's Data Type Manager.
-
-    Seeds the DTM with structure definitions from DC3 headers, enabling the
-    decompiler to use these types for type propagation and member inference.
-
-    Args:
-        binary_name: The name of the binary to operate on.
-        class_defs: List of class definitions. Each dict should have:
-            - name: str (class name)
-            - members: list of {"name": str, "type_str": str, "offset": int, "size": int?}
-            - total_size: int? (optional total size)
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        result = tools.create_structures(class_defs)
-        # Persist to disk so structs survive restarts
-        pyghidra_context.project.save(program_info.program)
-        return result
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error creating structures: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def apply_this_types(
-    binary_name: str,
-    class_methods: dict,
-    ctx: Context,
-) -> dict:
-    """Apply this pointer types to member functions.
-
-    Sets the first parameter (this) of member functions to the appropriate
-    class pointer type, enabling better type propagation in the decompiler.
-
-    Args:
-        binary_name: The name of the binary to operate on.
-        class_methods: Dict mapping class names to lists of function addresses.
-            Format: {"ClassName": ["823486e0", "82348700", ...]}
-            Addresses should be hex strings without 0x prefix.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        return tools.apply_this_types(class_methods)
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error applying this types: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def bulk_create_functions(
-    binary_name: str,
-    addresses: list[str],
-    ctx: Context,
-) -> dict:
-    """Create Function objects at addresses where Ghidra auto-analysis missed them.
-
-    Many map file addresses have code but no Ghidra function object. This bulk-creates
-    functions so they can be decompiled and have signatures applied.
-
-    Args:
-        binary_name: The name of the binary to operate on.
-        addresses: List of hex address strings without 0x prefix (e.g., ["823486e0", "82348700"]).
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        result = tools.bulk_create_functions(addresses)
-        pyghidra_context.project.save(program_info.program)
-        return result
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error creating functions: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def apply_demangled_signatures(
-    binary_name: str,
-    symbols: list[dict],
-    ctx: Context,
-) -> dict:
-    """Apply full function signatures by demangling MSVC mangled names.
-
-    Uses Ghidra's MicrosoftDemangler to parse mangled names into complete function
-    signatures (calling convention, return type, all parameter types) and applies them.
-    This is far more powerful than apply_this_types as it sets ALL parameters, not just this*.
-
-    Args:
-        binary_name: The name of the binary to operate on.
-        symbols: List of dicts, each with:
-            - "mangled": MSVC mangled name (e.g., "?Load@CharBonesSamples@@QAAXAAVBinStream@@@Z")
-            - "address": hex address without 0x prefix (e.g., "823486e0")
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        result = tools.apply_demangled_signatures(symbols)
-        pyghidra_context.project.save(program_info.program)
-        return result
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error applying demangled signatures: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def gen_callgraph(
-    binary_name: str,
-    function_name: str,
-    ctx: Context,
-    direction: CallGraphDirection = CallGraphDirection.CALLING,
-    display_type: CallGraphDisplayType = CallGraphDisplayType.FLOW,
-    condense_threshold: int = 50,
-    top_layers: int = 3,
-    bottom_layers: int = 3,
-) -> CallGraphResult:
-    """Generates a mermaidjs function call graph for a specified function.
-
-    Typically the 'calling' callgraph is most useful.
-    The resulting graph string is mermaidjs format. This output is critical for correct rendering.
-    The graph details function calls originating from (calling) or terminating at (called)
-    the target function.
-
-    Args:
-        binary_name: The name of the binary containing the function.
-        function_name: The name of the function to generate the call graph for.
-        direction: Direction of the call graph (calling or called).
-        display_type: Format of the graph (flow, flow_ends).
-        condense_threshold: Maximum number of edges before graph condensation is triggered.
-        top_layers: Number of top layers to show in a condensed graph.
-        bottom_layers: Number of bottom layers to show in a condensed graph.
-    """
-    try:
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        program_info = pyghidra_context.get_program_info(binary_name)
-        tools = GhidraTools(program_info)
-        return tools.gen_callgraph(
-            function_name_or_address=function_name,
-            cg_direction=direction,
-            cg_display_type=display_type,
-            include_refs=True,
-            max_depth=None,
-            max_run_time=60,
-            condense_threshold=condense_threshold,
-            top_layers=top_layers,
-            bottom_layers=bottom_layers,
-        )
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error generating call graph: {e!s}")
-        ) from e
-
-
-@mcp.tool()
-def import_binary(binary_path: str, ctx: Context) -> str:
-    """Imports a binary from a designated path into the current Ghidra project.
-
-    Args:
-        binary_path: The path to the binary file to import.
-    """
-    try:
-        # We would like to do context progress updates, but until that is more
-        # widely supported by clients, we will resort to this
-        pyghidra_context: PyGhidraContext = ctx.request_context.lifespan_context
-        pyghidra_context.import_binary_backgrounded(binary_path)
-        return (
-            f"Importing {binary_path} in the background."
-            "When ready, it will appear analyzed in binary list."
-        )
-    except Exception as e:
-        if isinstance(e, ValueError):
-            raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e))) from e
-        raise McpError(
-            ErrorData(code=INTERNAL_ERROR, message=f"Error importing binary: {e!s}")
-        ) from e
+# Module-level alias so main() can invoke diagnostics even though its --diagnose
+# CLI flag parameter shadows the diagnose() function name inside that scope.
+_run_diagnostics = diagnose
+
+
+def register_common_tools(server: FastMCP) -> None:
+    server.tool()(mcp_tools.decompile_function)
+    server.tool()(mcp_tools.search_symbols_by_name)
+    server.tool()(mcp_tools.search_code)
+    server.tool()(mcp_tools.list_project_binaries)
+    server.tool()(mcp_tools.list_project_binary_metadata)
+    server.tool()(mcp_tools.rename_function)
+    server.tool()(mcp_tools.rename_variable)
+    server.tool()(mcp_tools.set_variable_type)
+    server.tool()(mcp_tools.set_function_prototype)
+    server.tool()(mcp_tools.set_comment)
+    server.tool()(mcp_tools.delete_project_binary)
+    server.tool()(mcp_tools.list_exports)
+    server.tool()(mcp_tools.list_imports)
+    server.tool()(mcp_tools.list_xrefs)
+    server.tool()(mcp_tools.search_strings)
+    server.tool()(mcp_tools.read_bytes)
+    server.tool()(mcp_tools.gen_callgraph)
+    server.tool()(mcp_tools.import_binary)
+    # Fork-only tools (freeqaz/pyghidra-mcp)
+    server.tool()(mcp_tools.get_service_health)
+    server.tool()(mcp_tools.get_cache_stats)
+    server.tool()(mcp_tools.search_functions_by_name)
+    server.tool()(mcp_tools.list_structures)
+    server.tool()(mcp_tools.extract_structures)
+    server.tool()(mcp_tools.create_structures)
+    server.tool()(mcp_tools.apply_this_types)
+    server.tool()(mcp_tools.bulk_create_functions)
+    server.tool()(mcp_tools.apply_demangled_signatures)
+
+
+def register_gui_tools(server: FastMCP) -> None:
+    server.tool()(mcp_tools.list_open_programs)
+    server.tool()(mcp_tools.open_program_in_gui)
+    server.tool()(mcp_tools.set_current_program)
+    server.tool()(mcp_tools.goto)
+
+
+register_common_tools(mcp)
 
 
 def _detect_binary_language(binary_path: Path) -> tuple[str | None, str | None]:
@@ -1124,11 +447,14 @@ def _apply_map_symbols(
         pyghidra_context.project.save(program)
 
 
-def init_pyghidra_context(
+def init_pyghidra_context(  # noqa: C901
     mcp: FastMCP,
+    *,
+    transport: str,
     input_paths: list[Path],
     project_name: str,
     project_directory: str,
+    pyghidra_mcp_dir: Path,
     force_analysis: bool,
     verbose_analysis: bool,
     no_symbols: bool,
@@ -1142,6 +468,9 @@ def init_pyghidra_context(
     decompiler_timeout: int,
     list_project_binaries: bool,
     delete_project_binary: str | None,
+    symbols_path: str | None,
+    sym_file_path: str | None,
+    cache_manager: CacheManager | None = None,
     map_file: str | None = None,
 ) -> FastMCP:
     bin_paths: list[str | Path] = [Path(p) for p in input_paths]
@@ -1163,6 +492,7 @@ def init_pyghidra_context(
     pyghidra_context = PyGhidraContext(
         project_name=project_name,
         project_path=project_directory,
+        pyghidra_mcp_dir=pyghidra_mcp_dir,
         force_analysis=force_analysis,
         verbose_analysis=verbose_analysis,
         no_symbols=no_symbols,
@@ -1174,6 +504,10 @@ def init_pyghidra_context(
         wait_for_analysis=wait_for_analysis,
         skip_code_collection=skip_code_collection,
         decompiler_timeout=decompiler_timeout,
+        symbols_path=symbols_path,
+        sym_file_path=sym_file_path,
+        cache_manager=cache_manager,
+        map_file=map_file,
     )
 
     if list_project_binaries:
@@ -1196,13 +530,26 @@ def init_pyghidra_context(
             click.echo(f"Error: {e}", err=True)
         sys.exit(0)
 
+    imported_programs: list[str] = []
     if len(bin_paths) > 0:
         logger.info(f"Adding new bins: {', '.join(map(str, bin_paths))}")
         logger.info(f"Importing binaries to {project_directory}")
-        pyghidra_context.import_binaries(bin_paths)
+        imported_programs = pyghidra_context.import_binaries(bin_paths)
 
-    logger.info(f"Analyzing project: {pyghidra_context.project}")
-    pyghidra_context.analyze_project()
+    if imported_programs or force_analysis or wait_for_analysis:
+        logger.info(f"Analyzing project: {pyghidra_context.project}")
+        pyghidra_context.analyze_project()
+        if wait_for_analysis:
+            if transport != "stdio":
+                pyghidra_context.schedule_startup_indexing(
+                    max_binaries=max(len(pyghidra_context.programs), 1)
+                )
+        else:
+            for binary_name in imported_programs:
+                pyghidra_context.schedule_indexing(binary_name)
+    else:
+        logger.info("Skipping full-project analysis on startup; using existing project state.")
+        pyghidra_context.schedule_startup_indexing()
 
     # Apply map file symbols after analysis (if provided)
     if map_file:
@@ -1216,6 +563,42 @@ def init_pyghidra_context(
     logger.info("Server intialized")
 
     return mcp
+
+
+def init_gui_context(
+    mcp: FastMCP,
+    *,
+    project_spec: ProjectSpec,
+    input_paths: list[Path],
+) -> FastMCP:
+    logger.info("Waiting for Ghidra GUI project...")
+    gui_context = GuiPyGhidraContext(project_spec=project_spec)
+    if input_paths:
+        logger.info("Importing/opening GUI binaries: %s", ", ".join(map(str, input_paths)))
+        gui_context.import_binaries(input_paths)
+    gui_context.schedule_startup_indexing()
+    mcp._pyghidra_context = gui_context  # type: ignore
+    logger.info("GUI-backed server initialized")
+    return mcp
+
+
+def run_mcp_server(mcp: FastMCP, transport: str) -> None:
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    elif transport in ["streamable-http", "http"]:
+        mcp.run(transport="streamable-http")
+    elif transport == "sse":
+        import warnings
+
+        warnings.warn(
+            "SSE transport is deprecated per the MCP spec (June 2025). "
+            "Use --transport streamable-http instead.",
+            DeprecationWarning,
+            stacklevel=1,
+        )
+        mcp.run(transport="sse")
+    else:
+        raise ValueError(f"Invalid transport: {transport}")
 
 
 # MCP Server Entry Point
@@ -1238,7 +621,7 @@ def init_pyghidra_context(
     default="stdio",
     envvar="MCP_TRANSPORT",
     show_default=True,
-    help="Transport protocol to use.",
+    help="Transport protocol to use. Note: SSE is deprecated, use streamable-http instead.",
 )
 @optgroup.option(
     "-p",
@@ -1261,9 +644,16 @@ def init_pyghidra_context(
 @optgroup.option(
     "--project-path",
     type=click.Path(path_type=Path),
-    default=Path("pyghidra_mcp_projects/pyghidra_mcp"),
+    default=Path("pyghidra_mcp_projects"),
     show_default=True,
-    help="Path to the Ghidra project.",
+    help="Directory path to create new pyghidra-mcp project or an existing Ghidra .gpr file.",
+)
+@optgroup.option(
+    "--project-name",
+    type=str,
+    default="my_project",
+    show_default=True,
+    help="Name for the project (used for Ghidra project files). Ignored when using .gpr files.",
 )
 @optgroup.option(
     "--threaded/--no-threaded",
@@ -1283,6 +673,16 @@ def init_pyghidra_context(
     default=False,
     show_default=True,
     help="Wait for initial project analysis to complete before starting the server.",
+)
+@optgroup.option(
+    "--gui/--no-gui",
+    default=False,
+    show_default=True,
+    help=(
+        "Launch Ghidra GUI in-process, then open the requested project after startup and "
+        "serve MCP over HTTP against GUI-open programs. Cannot attach to an already-running "
+        "external Ghidra process."
+    ),
 )
 @optgroup.option(
     "--log-file",
@@ -1353,6 +753,19 @@ def init_pyghidra_context(
     help="Turn off symbols for analysis.",
 )
 @optgroup.option(
+    "--sym-file-path",
+    type=click.Path(exists=True),
+    default=None,
+    help="Specify single pdb symbol file for bin (default: None)",
+)
+@optgroup.option(
+    "-s",
+    "--symbols-path",
+    type=click.Path(),
+    default=None,
+    help="Path for local symbols directory (default: symbols)",
+)
+@optgroup.option(
     "--gdt",
     type=click.Path(exists=True),
     multiple=True,
@@ -1396,6 +809,7 @@ def main(
     transport: str,
     input_paths: list[Path],
     project_path: Path,
+    project_name: str,
     port: int,
     host: str,
     threaded: bool,
@@ -1408,10 +822,13 @@ def main(
     map_file: str | None,
     max_workers: int,
     wait_for_analysis: bool,
+    gui: bool,
     skip_code_collection: bool,
     decompiler_timeout: int,
     list_project_binaries: bool,
     delete_project_binary: str | None,
+    sym_file_path: str | None,
+    symbols_path: str | None,
     log_file: str | None,
     diagnose: bool,
     cache_dir: Path | None,
@@ -1429,9 +846,11 @@ def main(
     """
     global logger
 
-    # Handle --diagnose flag early (before any initialization)
+    # Handle --diagnose flag early (before any initialization). The CLI flag
+    # shadows the module-level diagnose() function in this scope, so call it
+    # through its module-level alias.
     if diagnose:
-        diagnose()
+        _run_diagnostics()
         sys.exit(0)
 
     # Reconfigure logging with file output if specified
@@ -1457,14 +876,66 @@ def main(
         click.echo(json.dumps(stats, indent=2))
         sys.exit(0)
 
-    project_name = project_path.stem
-    project_directory = str(project_path.parent)
+    try:
+        project_spec = ProjectSpec.from_cli(
+            project_path,
+            project_name,
+            default_project_name=DEFAULT_PROJECT_NAME,
+        )
+    except ValueError as e:
+        raise click.BadParameter(str(e)) from e
+
+    project_directory = str(project_spec.project_directory)
+    project_name = project_spec.project_name
+    pyghidra_mcp_dir = project_spec.pyghidra_mcp_dir
     mcp.settings.port = port
     mcp.settings.host = host
+
+    if gui:
+        if transport == "stdio":
+            raise click.UsageError("--gui requires --transport streamable-http or --transport http")
+        if transport == "sse":
+            raise click.UsageError("--gui requires --transport streamable-http or --transport http")
+        if list_project_binaries or delete_project_binary:
+            raise click.UsageError("GUI mode does not support project-management CLI actions yet")
+
+        register_gui_tools(mcp)
+        ensure_macos_framework_python()
+        launcher = GuiPyGhidraMcpLauncher(project_spec.gpr_path)
+        launcher.start()
+        gui_server_error: list[BaseException] = []
+
+        def gui_server_thread() -> None:
+            try:
+                init_gui_context(mcp=mcp, project_spec=project_spec, input_paths=input_paths)
+                run_mcp_server(mcp, transport)
+            except BaseException as exc:
+                gui_server_error.append(exc)
+                logger.exception("GUI MCP server failed during startup or runtime.")
+                launcher.request_shutdown()
+
+        server_thread = threading.Thread(
+            target=gui_server_thread,
+            name="pyghidra-mcp-gui-server",
+            daemon=True,
+        )
+        server_thread.start()
+        try:
+            launcher.run_gui_event_loop()
+        finally:
+            launcher.request_shutdown()
+            launcher.wait_for_shutdown()
+            context = getattr(mcp, "_pyghidra_context", None)
+            if context is not None:
+                context.close()
+        if gui_server_error:
+            raise RuntimeError("GUI MCP server failed to start.") from gui_server_error[0]
+        return
 
     init_pyghidra_context(
         mcp=mcp,
         input_paths=input_paths,
+        transport=transport,
         project_name=project_name,
         project_directory=project_directory,
         force_analysis=force_analysis,
@@ -1480,18 +951,15 @@ def main(
         decompiler_timeout=decompiler_timeout,
         list_project_binaries=list_project_binaries,
         delete_project_binary=delete_project_binary,
+        pyghidra_mcp_dir=pyghidra_mcp_dir,
+        sym_file_path=sym_file_path,
+        symbols_path=symbols_path,
+        cache_manager=cache_manager,
         map_file=map_file,
     )
 
     try:
-        if transport == "stdio":
-            mcp.run(transport="stdio")
-        elif transport in ["streamable-http", "http"]:
-            mcp.run(transport="streamable-http")
-        elif transport == "sse":
-            mcp.run(transport="sse")
-        else:
-            raise ValueError(f"Invalid transport: {transport}")
+        run_mcp_server(mcp, transport)
     finally:
         mcp._pyghidra_context.close()  # type: ignore
 

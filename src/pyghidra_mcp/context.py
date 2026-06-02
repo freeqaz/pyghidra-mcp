@@ -3,19 +3,26 @@ import hashlib
 import json
 import logging
 import multiprocessing
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Union
 
 import chromadb
-import pyghidra  # noqa
-from chromadb.config import Settings
 
-from pyghidra_mcp.tools import GhidraTools
+from pyghidra_mcp.cache_manager import CacheManager, compute_binary_hash
+from pyghidra_mcp.decompiler_pool import DecompilerPool
+from pyghidra_mcp.import_detection import is_ghidra_importable
+from pyghidra_mcp.import_planning import ImportCandidate, build_import_plan
+from pyghidra_mcp.indexing_mixin import IndexingMixin
+from pyghidra_mcp.models import (
+    ImportRequestResult,
+    ProgramInfo as ProgramInfoModel,
+    SkippedImport as SkippedImportModel,
+)
 
 if TYPE_CHECKING:
-    from ghidra.app.decompiler import DecompInterface
     from ghidra.base.project import GhidraProject
     from ghidra.framework.model import DomainFile
     from ghidra.program.flatapi import FlatProgramAPI
@@ -33,14 +40,15 @@ class ProgramInfo:
     name: str
     program: "Program"
     flat_api: "FlatProgramAPI | None"
-    decompiler: "DecompInterface"
+    decompiler_pool: DecompilerPool
     metadata: dict  # Ghidra program metadata
     ghidra_analysis_complete: bool
     file_path: Path | None = None
     load_time: float | None = None
     code_collection: chromadb.Collection | None = None
-    strings_collection: chromadb.Collection | None = None
+    strings: list | None = None
     decompiler_timeout: int = 0
+    binary_hash: str | None = None
 
     @property
     def analysis_complete(self) -> bool:
@@ -48,15 +56,18 @@ class ProgramInfo:
         return self.ghidra_analysis_complete
 
 
-class PyGhidraContext:
+class PyGhidraContext(IndexingMixin):
     """
     Manages a Ghidra project, including its creation, program imports, and cleanup.
     """
+
+    _analysis_bundle_host_lock = threading.RLock()
 
     def __init__(
         self,
         project_name: str,
         project_path: str | Path,
+        pyghidra_mcp_dir: Path | None = None,
         force_analysis: bool = False,
         verbose_analysis: bool = False,
         no_symbols: bool = False,
@@ -68,6 +79,10 @@ class PyGhidraContext:
         wait_for_analysis: bool = False,
         skip_code_collection: bool = False,
         decompiler_timeout: int = 0,
+        symbols_path: str | Path | None = None,
+        sym_file_path: str | Path | None = None,
+        cache_manager: "CacheManager | None" = None,
+        map_file: str | Path | None = None,
     ):
         """
         Initializes a new Ghidra project context.
@@ -85,9 +100,11 @@ class PyGhidraContext:
             max_workers: Number of workers for threaded analysis.
             wait_for_analysis: Wait for initial project analysis to complete.
             skip_code_collection: Skip the ChromaDB code-collection build (the
-                per-function decompile pass); the strings collection still builds.
+                per-function decompile pass); strings indexing still runs.
             decompiler_timeout: Per-function decompiler timeout in seconds
                 (0 = no timeout), applied to interactive and build decompiles.
+            symbols_path: Path to local symbol store.
+            sym_file_path: Path to a specific PDB file.
         """
         from ghidra.base.project import GhidraProject
 
@@ -97,24 +114,33 @@ class PyGhidraContext:
         # _init_program_info() and reads these to populate each ProgramInfo.
         self.skip_code_collection = skip_code_collection
         self.decompiler_timeout = decompiler_timeout
+        # Decompile cache + MSVC .map source, reachable from mcp_tools via the
+        # context (mcp_tools builds GhidraTools(program_info, cache_manager=...,
+        # map_file=...)) and from the IndexingMixin for the SQLite strings store.
+        self.cache_manager = cache_manager
+        self.map_file = Path(map_file) if map_file else None
         self.project: GhidraProject = self._get_or_create_project()
 
-        self.programs: dict[str, ProgramInfo] = {}
-        self._init_project_programs()
-
-        project_dir = self.project_path / self.project_name
-        chromadb_path = project_dir / "chromadb"
-        self.chroma_client = chromadb.PersistentClient(
-            path=str(chromadb_path), settings=Settings(anonymized_telemetry=False)
-        )
+        # Use provided pyghidra-mcp directory or create default
+        if pyghidra_mcp_dir:
+            self.pyghidra_mcp_dir = pyghidra_mcp_dir
+        else:
+            # Default: create pyghidra-mcp directory alongside project
+            self.pyghidra_mcp_dir = self.project_path / "pyghidra-mcp"
 
         # From GhidraDiffEngine
         self.force_analysis = force_analysis
         self.verbose_analysis = verbose_analysis
         self.no_symbols = no_symbols
         self.gdts = gdts if gdts is not None else []
+
+        # Symbol configuration
+        self.symbols_path = (
+            Path(symbols_path) if symbols_path else self.pyghidra_mcp_dir / "symbols"
+        )
+        self.sym_file_path = Path(sym_file_path) if sym_file_path else None
         self.program_options = program_options
-        self.gzfs_path = Path(gzfs_path) if gzfs_path else self.project_path / "gzfs"
+        self.gzfs_path = Path(gzfs_path) if gzfs_path else self.pyghidra_mcp_dir / "gzfs"
         if self.gzfs_path:
             self.gzfs_path.mkdir(exist_ok=True, parents=True)
 
@@ -125,6 +151,7 @@ class PyGhidraContext:
         if not self.threaded:
             logger.warn("--no-threaded flag forcing max_workers to 1")
             self.max_workers = 1
+        self._init_indexing_state(self.pyghidra_mcp_dir, threaded=self.threaded)
         self.executor = (
             concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
             if self.threaded
@@ -135,21 +162,27 @@ class PyGhidraContext:
         )
         self.wait_for_analysis = wait_for_analysis
 
+        self.programs: dict[str, ProgramInfo] = {}
+        self._init_project_programs()
+
     def close(self, save: bool = True):
         """
         Saves changes to all open programs and closes the project.
         """
+        if self.executor:
+            self.executor.shutdown(wait=True)
+
+        self.shutdown_indexing()
+
+        if self.import_executor:
+            self.import_executor.shutdown(wait=True)
+
         for _program_name, program_info in self.programs.items():
+            self._dispose_decompiler(program_info)
             program = program_info.program
             if save:
                 self.project.save(program)
             self.project.close(program)
-
-        if self.executor:
-            self.executor.shutdown(wait=True)
-
-        if self.import_executor:
-            self.import_executor.shutdown(wait=True)
 
         self.project.close()
         logger.info(f"Project {self.project_name} closed.")
@@ -165,7 +198,8 @@ class PyGhidraContext:
         from ghidra.base.project import GhidraProject
         from ghidra.framework.model import ProjectLocator
 
-        project_dir = self.project_path / self.project_name
+        # For standard Ghidra projects, use directory containing .gpr file
+        project_dir = self.project_path
         project_dir.mkdir(exist_ok=True, parents=True)
         project_dir_str = str(project_dir.absolute())
 
@@ -184,14 +218,12 @@ class PyGhidraContext:
         """
         from ghidra.program.model.listing import Program
 
-        all_binary_paths = self.list_binaries()
-        for binary_path_s in all_binary_paths:
-            binary_path = Path(binary_path_s)
-            program: Program = self.project.openProgram(
-                str(binary_path.parent), binary_path.name, False
-            )
+        for domain_file in self.list_binary_domain_files():
+            parent = domain_file.getParent()
+            parent_path = parent.pathname if parent else "/"
+            program: Program = self.project.openProgram(parent_path, domain_file.getName(), False)
             program_info = self._init_program_info(program)
-            self.programs[binary_path_s] = program_info
+            self.programs[domain_file.pathname] = program_info
 
     def list_binaries(self) -> list[str]:
         """List all the binaries within the Ghidra project."""
@@ -205,6 +237,27 @@ class PyGhidraContext:
             return names
 
         return list_folder_contents(self.project.getRootFolder())
+
+    def list_program_infos(self) -> list[ProgramInfo]:
+        """Return loaded program infos for MCP project listing."""
+        return list(self.programs.values())
+
+    def list_project_binary_infos(self) -> list[ProgramInfoModel]:
+        """Return MCP response models for project binaries."""
+        program_infos = []
+        for name, pi in self.programs.items():
+            program_infos.append(
+                ProgramInfoModel(
+                    name=name,
+                    file_path=str(pi.file_path) if pi.file_path else None,
+                    load_time=pi.load_time,
+                    analysis_complete=pi.analysis_complete,
+                    metadata={},
+                    code_indexed=pi.code_collection is not None,
+                    strings_indexed=pi.strings is not None,
+                )
+            )
+        return program_infos
 
     def list_binary_domain_files(self) -> list["DomainFile"]:
         """Return a list of DomainFile objects for all binaries in the project.
@@ -246,6 +299,7 @@ class PyGhidraContext:
             try:
                 program_to_delete: Program = program_info.program
                 program_to_delete_df: DomainFile = program_to_delete.getDomainFile()
+                self._dispose_decompiler(program_info)
                 self.project.close(program_to_delete)
                 program_to_delete_df.delete()
                 # clean up program reference
@@ -261,7 +315,7 @@ class PyGhidraContext:
         analyze: bool = False,
         relative_path: Path | None = None,
         language: str | None = None,
-    ) -> None:
+    ) -> str | list[str]:
         """
         Imports a single binary into the project.
 
@@ -273,7 +327,7 @@ class PyGhidraContext:
                       If None, Ghidra auto-detects the language from the binary format.
 
         Returns:
-            None
+            Imported program pathname.
         """
         from ghidra.program.model.listing import Program
 
@@ -312,12 +366,15 @@ class PyGhidraContext:
                 lang_service = DefaultLanguageService.getLanguageService()
                 lang = lang_service.getLanguage(LanguageID(language))
                 compiler_spec = lang.getDefaultCompilerSpec()
-                program = self.project.importProgram(binary_path, lang, compiler_spec)
+                imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
             else:
-                program = self.project.importProgram(binary_path)
+                imported_program = self.project.importProgram(binary_path)
+            program = imported_program
             program.name = program_name
             if program:
                 self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
+                self.project.close(imported_program)
+                program = self.project.openProgram(ghidra_folder.pathname, program_name, False)
 
             program_info = self._init_program_info(program)
             self.programs[program.getDomainFile().pathname] = program_info
@@ -327,9 +384,10 @@ class PyGhidraContext:
 
         if analyze:
             self.analyze_program(program_info.program)
-            self._init_chroma_collections_for_program(program_info)
+            self.schedule_indexing(str(program.getDomainFile().pathname))
 
         logger.info(f"Program {program_name} is ready for use.")
+        return str(program.getDomainFile().pathname)
 
     @staticmethod
     def _create_folder_hierarchy(root_folder, relative_path: Path):
@@ -357,7 +415,7 @@ class PyGhidraContext:
 
         return current_folder
 
-    def import_binaries(self, binary_paths: list[str | Path], analyze: bool = False):
+    def import_binaries(self, binary_paths: list[str | Path], analyze: bool = False) -> list[str]:
         """
         Imports a list of binaries into the project.
         If an entry is a directory it will be walked recursively
@@ -368,58 +426,61 @@ class PyGhidraContext:
             binary_paths: A list of paths to the binary files or directories.
             analyze: Whether to analyze the imported binaries.
         """
-        resolved_paths: list[Path] = [Path(p) for p in binary_paths]
+        import_plan = build_import_plan(binary_paths)
+        files_to_import = [
+            (candidate.path, candidate.relative_path) for candidate in import_plan.candidates
+        ]
 
-        # Tuple of (full system path, relative path from provided path)
-        files_to_import: list[tuple[Path, Path | None]] = []
-        for p in resolved_paths:
-            if p.is_dir():
-                logger.info(f"Discovering files in directory: {p}")
-                for f in p.rglob("*"):
-                    if f.is_file() and self._is_binary_file(f):
-                        # Store the relative path (e.g., "bin" or "lib/subfolder")
-                        relative = f.relative_to(p).parent
-                        files_to_import.append((f, relative))
-            elif p.is_file() and self._is_binary_file(p):
-                files_to_import.append((p, None))
+        for skipped in import_plan.skipped:
+            logger.info("Skipping %s: %s", skipped.path, skipped.reason)
 
         if not files_to_import:
             logger.info("No files found to import from provided paths.")
-            return
+            return []
 
         logger.info(f"Importing {len(files_to_import)} binary files into project...")
-        for bin_path, relative_path in files_to_import:
+        return self._import_candidates(import_plan.candidates, analyze=analyze)
+
+    def _import_candidates(
+        self,
+        candidates: list[ImportCandidate],
+        *,
+        analyze: bool = False,
+    ) -> list[str]:
+        imported_programs: list[str] = []
+        for candidate in candidates:
             try:
-                self.import_binary(bin_path, analyze=analyze, relative_path=relative_path)
+                imported = self.import_binary(
+                    candidate.path,
+                    analyze=analyze,
+                    relative_path=candidate.relative_path,
+                )
+                if isinstance(imported, list):
+                    imported_programs.extend(imported)
+                else:
+                    imported_programs.append(imported)
             except Exception as e:
-                logger.error(f"Failed to import {bin_path}: {e}")
+                logger.error(f"Failed to import {candidate.path}: {e}")
                 # continue importing remaining files
+        return imported_programs
 
     @staticmethod
-    def _is_binary_file(path: Path) -> bool:
-        """
-        Quick header-based check for common binary formats.
-        Recognizes ELF (0x7f 'ELF'), PE ('MZ' DOS header), and XEX ('XEX2') signatures.
-        Returns False on read errors or unknown signatures.
+    def _is_xex2(path: Path) -> bool:
+        """Return True if the file has the Xbox 360 XEX2 magic header.
+
+        Ghidra only advertises an XEX loader when the XEXLoaderWV extension is
+        installed; this magic check keeps XEX binaries importable regardless of
+        loader-registration timing.
         """
         try:
             with path.open("rb") as f:
-                header = f.read(4)
-                if not header:
-                    return False
-                # ELF: 0x7f 'ELF'
-                if header.startswith(b"\x7fELF"):
-                    return True
-                # PE executables typically start with 'MZ' (DOS stub)
-                if header.startswith(b"MZ"):
-                    return True
-                # XEX: 'XEX2' (Xbox 360 executables)
-                if header.startswith(b"XEX2"):
-                    return True
-                return False
+                return f.read(4).startswith(b"XEX2")
         except Exception as e:
             logger.debug(f"Could not read file header for {path}: {e}")
             return False
+
+    def _is_binary_file(self, path: Path) -> bool:
+        return is_ghidra_importable(path) or self._is_xex2(path)
 
     @staticmethod
     def detect_language_for_binary(binary_path: Path) -> str | None:
@@ -463,7 +524,7 @@ class PyGhidraContext:
             logger.error(f"FATAL ERROR during background binary import: {e}", exc_info=True)
             raise e
 
-    def import_binary_backgrounded(self, binary_path: str | Path):
+    def import_binary_backgrounded(self, binary_path: str | Path) -> ImportRequestResult:
         """
         Spawns a thread and imports a binary into the project.
         When the binary is analyzed it will be added to the project.
@@ -474,29 +535,46 @@ class PyGhidraContext:
         if not Path(binary_path).exists():
             raise FileNotFoundError(f"The file {binary_path} cannot be found")
 
-        if self.import_executor:
-            future = self.import_executor.submit(self.import_binary, binary_path, analyze=True)
+        import_plan = build_import_plan([binary_path])
+
+        if self.import_executor and import_plan.candidates:
+            future = self.import_executor.submit(
+                self._import_candidates,
+                import_plan.candidates,
+                analyze=True,
+            )
             future.add_done_callback(self._import_callback)
-        else:
-            self.import_binary(binary_path, analyze=True)
+        elif import_plan.candidates:
+            self._import_candidates(import_plan.candidates, analyze=True)
+
+        queued_paths = [str(candidate.path) for candidate in import_plan.candidates]
+        skipped = [
+            SkippedImportModel(path=str(skipped.path), reason=skipped.reason)
+            for skipped in import_plan.skipped
+        ]
+        message = (
+            f"Queued {len(queued_paths)} import(s) from {binary_path} in the background."
+            if queued_paths
+            else f"No importable files were queued from {binary_path}."
+        )
+        return ImportRequestResult(
+            requested_path=str(binary_path),
+            queued_count=len(queued_paths),
+            queued_paths=queued_paths,
+            skipped_count=len(skipped),
+            skipped=skipped,
+            message=message,
+        )
 
     def get_program_info(self, binary_name: str) -> "ProgramInfo":
         """Get program info or raise ValueError if not found."""
-        program_info = self.programs.get(binary_name)
+        program_info = self._lookup_program_info(binary_name)
         if not program_info:
             # Exact program name not in the list
             available_progs = list(self.programs.keys())
-
-            # If the LLM gave us just the binary name, use that
-            available_prog_names = {
-                Path(prog).name: prog_info for prog, prog_info in self.programs.items()
-            }
-            program_info = available_prog_names.get(binary_name)
-
-            if not program_info:
-                raise ValueError(
-                    f"Binary {binary_name} not found. Available binaries: {available_progs}"
-                )
+            raise ValueError(
+                f"Binary {binary_name} not found. Available binaries: {available_progs}"
+            )
         if not program_info.analysis_complete:
             raise RuntimeError(
                 json.dumps(
@@ -504,13 +582,24 @@ class PyGhidraContext:
                         "message": f"Analysis incomplete for binary '{binary_name}'.",
                         "binary_name": binary_name,
                         "ghidra_analysis_complete": program_info.ghidra_analysis_complete,
-                        "code_collection": program_info.code_collection is not None,
-                        "strings_collection": program_info.strings_collection is not None,
+                        "code_indexed": program_info.code_collection is not None,
+                        "strings_indexed": program_info.strings is not None,
                         "suggestion": "Wait and try tool call again.",
                     }
                 )
             )
+        self.schedule_indexing(binary_name)
         return program_info
+
+    def _lookup_program_info(self, binary_name: str) -> "ProgramInfo | None":
+        program_info = self.programs.get(binary_name)
+        if program_info is not None:
+            return program_info
+
+        available_prog_names = {
+            Path(prog).name: prog_info for prog, prog_info in self.programs.items()
+        }
+        return available_prog_names.get(binary_name)
 
     def _init_program_info(self, program):
         from ghidra.program.flatapi import FlatProgramAPI
@@ -518,19 +607,25 @@ class PyGhidraContext:
         assert program is not None
 
         metadata = self.get_metadata(program)
+        file_path = metadata["Executable Location"]
+
+        # Compute the binary hash once here (not per GhidraTools construction) so
+        # the decompile cache and the SQLite strings store can key off it cheaply.
+        binary_hash = compute_binary_hash(Path(file_path)) if file_path else None
 
         program_info = ProgramInfo(
             name=program.name,
             program=program,
             flat_api=FlatProgramAPI(program),
-            decompiler=self.setup_decompiler(program),
+            decompiler_pool=self._create_decompiler_pool(program),
             metadata=metadata,
             ghidra_analysis_complete=False,
-            file_path=metadata["Executable Location"],
+            file_path=file_path,
             load_time=time.time(),
             code_collection=None,
-            strings_collection=None,
+            strings=None,
             decompiler_timeout=self.decompiler_timeout,
+            binary_hash=binary_hash,
         )
 
         return program_info
@@ -554,134 +649,13 @@ class PyGhidraContext:
 
         return "-".join((path.name, _sha1_file(path.absolute())[:6]))
 
-    def _init_chroma_code_collection_for_program(self, program_info: ProgramInfo):
-        """
-        Initialize Chroma code collection for a single program.
-        """
-        from ghidra.program.model.listing import Function
-
-        if self.skip_code_collection:
-            logger.info(
-                f"skip_code_collection set; skipping code collection for {program_info.name}"
-            )
-            return
-
-        logger.info(f"Initializing Chroma code collection for {program_info.name}")
-        try:
-            collection = self.chroma_client.get_collection(name=program_info.name)
-            logger.info(f"Collection '{program_info.name}' exists; skipping code ingest.")
-            program_info.code_collection = collection
-        except Exception:
-            logger.info(f"Creating new code collection '{program_info.name}'")
-            tools = GhidraTools(program_info)
-            functions = tools.get_all_functions()
-            decompiles = []
-            ids = []
-            metadatas = []
-
-            for i, func in enumerate(functions):
-                func: Function
-                try:
-                    if i % 10 == 0:
-                        logger.debug(f"Decompiling {i}/{len(functions)}")
-                    decompiled = tools.decompile_function(func)
-                    decompiles.append(decompiled.code)
-                    ids.append(decompiled.name)
-                    metadatas.append(
-                        {
-                            "function_name": decompiled.name,
-                            "entry_point": str(func.getEntryPoint()),
-                        }
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to decompile {func.getSymbol().getName(True)}: {e}")
-
-            collection = self.chroma_client.create_collection(name=program_info.name)
-            BATCH_SIZE = 5000
-            try:
-                for batch_start in range(0, len(decompiles), BATCH_SIZE):
-                    batch_end = batch_start + BATCH_SIZE
-                    collection.add(
-                        documents=decompiles[batch_start:batch_end],
-                        metadatas=metadatas[batch_start:batch_end],
-                        ids=ids[batch_start:batch_end],
-                    )
-                    logger.info(f"Indexed code batch {batch_start}-{min(batch_end, len(decompiles))}/{len(decompiles)}")
-            except Exception as e:
-                logger.error(f"Failed add decompiles to collection: {e}")
-
-            logger.info(f"Code analysis complete for collection '{program_info.name}'")
-            program_info.code_collection = collection
-
-    def _init_chroma_strings_collection_for_program(self, program_info: ProgramInfo):
-        """
-        Initialize Chroma strings collection for a single program.
-        """
-        collection_name = f"{program_info.name}_strings"
-        logger.info(f"Initializing Chroma strings collection for {program_info.name}")
-        try:
-            strings_collection = self.chroma_client.get_collection(name=collection_name)
-            logger.info(f"Collection '{collection_name}' exists; skipping strings ingest.")
-            program_info.strings_collection = strings_collection
-        except Exception:
-            logger.info(f"Creating new strings collection '{collection_name}'")
-            tools = GhidraTools(program_info)
-
-            ids = []
-            strings = tools.get_all_strings()
-            metadatas = [{"address": str(s.address)} for s in strings]
-            ids = [str(s.address) for s in strings]
-            strings = [s.value for s in strings]
-
-            strings_collection = self.chroma_client.create_collection(name=collection_name)
-            BATCH_SIZE = 5000
-            try:
-                for batch_start in range(0, len(strings), BATCH_SIZE):
-                    batch_end = batch_start + BATCH_SIZE
-                    strings_collection.add(
-                        documents=strings[batch_start:batch_end],
-                        metadatas=metadatas[batch_start:batch_end],
-                        ids=ids[batch_start:batch_end],
-                    )
-                    logger.info(f"Indexed strings batch {batch_start}-{min(batch_end, len(strings))}/{len(strings)}")
-            except Exception as e:
-                logger.error(f"Failed to add strings to collection: {e}")
-
-            logger.info(f"Strings analysis complete for collection '{collection_name}'")
-            program_info.strings_collection = strings_collection
-
-    def _init_chroma_collections_for_program(self, program_info: ProgramInfo):
-        """
-        Initializes all Chroma collections (code and strings) for a single program.
-        """
-        self._init_chroma_code_collection_for_program(program_info)
-        self._init_chroma_strings_collection_for_program(program_info)
-
-    def _init_all_chroma_collections(self):
-        """
-        Initializes Chroma collections for all programs in the project.
-        If an executor is available, tasks are submitted asynchronously.
-        Otherwise, initialization runs in the main thread.
-        """
-        programs = list(self.programs.values())
-        mode = "background" if self.executor else "main thread"
-        logger.info("Initializing Chroma DB collections in %s...", mode)
-
-        # ensure analysis complete before init
-        assert all(prog.analysis_complete for prog in programs)
-
-        if self.executor:
-            # executor.map submits all tasks at once, returns an iterator of futures
-            self.executor.map(self._init_chroma_collections_for_program, programs)
-        else:
-            for program_info in programs:
-                self._init_chroma_collections_for_program(program_info)
-
     # Callback function that runs when the future is done to catch any exceptions
     def _analysis_done_callback(self, future: concurrent.futures.Future):
         try:
             future.result()
             logging.info("Asynchronous analysis finished successfully.")
+            if not self.wait_for_analysis:
+                self.schedule_startup_indexing(max_binaries=max(len(self.programs), 1))
         except Exception as e:
             logging.error(f"Asynchronous analysis failed with exception: {e}")
             raise e
@@ -714,6 +688,7 @@ class PyGhidraContext:
         else:
             # No executor: just run synchronously
             self._analyze_project(require_symbols, force_analysis, verbose_analysis)
+            self.schedule_startup_indexing(max_binaries=max(len(self.programs), 1))
             return None
 
     def _analyze_project(
@@ -757,22 +732,18 @@ class PyGhidraContext:
 
         logger.info("All programs analyzed.")
 
-        # Persist analysis to disk SERIALLY. analyze_program already saves each program
-        # in its own worker thread (finally: project.save), but when several programs
-        # analyze concurrently those saves race on the shared GhidraProject and the
-        # on-disk programs can be left unanalyzed -> reopened as import stubs and
-        # re-analyzed on every launch. Re-saving here, back in the single
-        # _analyze_project thread, makes a multi-binary project's analysis durable.
+        # Persist analysis to disk SERIALLY. analyze_program already saves each
+        # program under _analysis_bundle_host_lock, but re-saving here (back in the
+        # single _analyze_project thread) is cheap belt-and-suspenders that keeps a
+        # multi-binary project's analysis durable across relaunch. Indexing is NOT
+        # kicked off here anymore: it is scheduled lazily by _analysis_done_callback
+        # -> schedule_startup_indexing (IndexingMixin).
         for _pi in list(self.programs.values()):
             try:
                 self.project.save(_pi.program)
             except Exception as e:
                 logger.error(f"Failed to persist analysis for {_pi.name}: {e}")
         logger.info("Analysis persisted to project.")
-
-        # The chroma collections need to be initialized after analysis is complete
-        # At this point, threaded or not, all analysis is done
-        self._init_all_chroma_collections()  # DO NOT MOVE
 
     def analyze_program(  # noqa C901
         self,
@@ -781,12 +752,14 @@ class PyGhidraContext:
         force_analysis: bool = False,
         verbose_analysis: bool = False,
     ):
+        # Import symbol utilities from ghidrecomp
         from ghidra.app.script import GhidraScriptUtil
         from ghidra.framework.model import DomainFile
         from ghidra.program.flatapi import FlatProgramAPI
         from ghidra.program.model.listing import Program
         from ghidra.program.util import GhidraProgramUtilities
         from ghidra.util.task import ConsoleTaskMonitor
+        from ghidrecomp.utility import get_pdb, set_pdb, set_remote_pdbs, setup_symbol_server
 
         df = df_or_prog
         if not isinstance(df_or_prog, DomainFile):
@@ -825,43 +798,63 @@ class PyGhidraContext:
             or force_analysis
             or self.force_analysis
         ):
-            GhidraScriptUtil.acquireBundleHostReference()
+            with self._analysis_bundle_host_lock:
+                GhidraScriptUtil.acquireBundleHostReference()
 
-            if program and program.getFunctionManager().getFunctionCount() > 1000:
-                # Force Decomp Param ID is not set
-                if (
-                    self.program_options is not None
-                    and self.program_options.get("program_options", {})
-                    .get("Analyzers", {})
-                    .get("Decompiler Parameter ID")
-                    is None
-                ):
-                    self.set_analysis_option(program, "Decompiler Parameter ID", True)
+                if program and program.getFunctionManager().getFunctionCount() > 1000:
+                    # Force Decomp Param ID is not set
+                    if (
+                        self.program_options is not None
+                        and self.program_options.get("program_options", {})
+                        .get("Analyzers", {})
+                        .get("Decompiler Parameter ID")
+                        is None
+                    ):
+                        self.set_analysis_option(program, "Decompiler Parameter ID", True)
 
-            if self.program_options:
-                analyzer_options = self.program_options.get("program_options", {}).get(
-                    "Analyzers", {}
-                )
-                for k, v in analyzer_options.items():
-                    logger.info(f"Setting prog option:{k} with value:{v}")
-                    self.set_analysis_option(program, k, v)
+                if self.program_options:
+                    analyzer_options = self.program_options.get("program_options", {}).get(
+                        "Analyzers", {}
+                    )
+                    for k, v in analyzer_options.items():
+                        logger.info(f"Setting prog option:{k} with value:{v}")
+                        self.set_analysis_option(program, k, v)
 
-            if self.no_symbols:
-                logger.warn(f"Disabling symbols for analysis! --no-symbols flag: {self.no_symbols}")
-                self.set_analysis_option(program, "PDB Universal", False)
+                if self.no_symbols:
+                    logger.warn(
+                        f"Disabling symbols for analysis! --no-symbols flag: {self.no_symbols}"
+                    )
+                    self.set_analysis_option(program, "PDB Universal", False)
 
-            logger.info(f"Starting Ghidra analysis of {program}...")
-            try:
-                flat_api.analyzeAll(program)
-                if hasattr(GhidraProgramUtilities, "setAnalyzedFlag"):
-                    GhidraProgramUtilities.setAnalyzedFlag(program, True)
-                elif hasattr(GhidraProgramUtilities, "markProgramAnalyzed"):
-                    GhidraProgramUtilities.markProgramAnalyzed(program)
                 else:
-                    raise Exception("Missing set analyzed flag method!")
-            finally:
-                GhidraScriptUtil.releaseBundleHostReference()
-                self.project.save(program)
+                    # Configure symbols if enabled
+                    if self.sym_file_path:
+                        logger.info(f"Setting PDB file: {self.sym_file_path}")
+                        set_pdb(program, self.sym_file_path)
+                    else:
+                        logger.info(f"Setting up symbol server at {self.symbols_path}")
+                        setup_symbol_server(self.symbols_path)
+                        set_remote_pdbs(program, True)
+
+                    # Verify PDB loaded
+                    pdb = get_pdb(program)
+                    if pdb is None:
+                        logger.warn(f"Failed to find pdb for {program.name}")
+                    else:
+                        logger.info(f"Loaded pdb: {pdb}")
+
+                logger.info(f"Starting Ghidra analysis of {program}...")
+                try:
+                    flat_api.analyzeAll(program)
+                    if hasattr(GhidraProgramUtilities, "setAnalyzedFlag"):
+                        GhidraProgramUtilities.setAnalyzedFlag(program, True)
+                    elif hasattr(GhidraProgramUtilities, "markProgramAnalyzed"):
+                        GhidraProgramUtilities.markProgramAnalyzed(program)
+                    else:
+                        raise Exception("Missing set analyzed flag method!")
+                finally:
+                    GhidraScriptUtil.releaseBundleHostReference()
+                    self.project.save(program)
         else:
             logger.info(f"Analysis already complete.. skipping {program}!")
 
@@ -1027,7 +1020,7 @@ class PyGhidraContext:
         meta = prog.getMetadata()
         return dict(meta)
 
-    def setup_decompiler(self, program: "Program") -> "DecompInterface":
+    def setup_decompiler(self, program: "Program"):
         from ghidra.app.decompiler import DecompileOptions, DecompInterface
 
         prog_options = DecompileOptions()
@@ -1044,3 +1037,14 @@ class PyGhidraContext:
         decomp.openProgram(program)
 
         return decomp
+
+    def _create_decompiler_pool(self, program: "Program") -> DecompilerPool:
+        pool_size = 2 if self.threaded else 1
+        return DecompilerPool(lambda: self.setup_decompiler(program), size=pool_size)
+
+    @staticmethod
+    def _dispose_decompiler(program_info: ProgramInfo) -> None:
+        try:
+            program_info.decompiler_pool.dispose()
+        except Exception:
+            logger.debug("Failed to dispose decompiler pool", exc_info=True)

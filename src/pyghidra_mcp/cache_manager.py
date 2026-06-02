@@ -79,6 +79,27 @@ class CacheManager:
                     """
                 )
 
+                # Strings index (replaces the old ChromaDB strings collection).
+                # Persisted + shared across instances via the same cache.db, so
+                # strings are extracted once per binary and never re-indexed.
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS strings_cache (
+                        binary_hash TEXT NOT NULL,
+                        address TEXT NOT NULL,
+                        value TEXT NOT NULL,
+                        PRIMARY KEY (binary_hash, address)
+                    )
+                    """
+                )
+
+                conn.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_strings_binary_hash
+                    ON strings_cache(binary_hash)
+                    """
+                )
+
                 conn.commit()
         except Exception as e:
             logger.error(f"Database initialization failed: {e}")
@@ -271,6 +292,84 @@ class CacheManager:
                 "enabled": True,
                 "error": str(e),
             }
+
+    def has_strings(self, binary_hash: str) -> bool:
+        """Return True if strings for this binary have already been indexed."""
+        if not self.enabled:
+            return False
+        try:
+            with self._lock:
+                with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                    cursor = conn.execute(
+                        "SELECT 1 FROM strings_cache WHERE binary_hash = ? LIMIT 1",
+                        (binary_hash,),
+                    )
+                    return cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Cache has_strings failed: {e}")
+            return False
+
+    def put_strings(self, binary_hash: str, items: list[tuple[str, str]]) -> bool:
+        """Store extracted strings for a binary.
+
+        Args:
+            binary_hash: Hash of the binary.
+            items: List of (address, value) string pairs.
+
+        Returns:
+            True if stored, False otherwise.
+        """
+        if not self.enabled:
+            return False
+        try:
+            with self._lock:
+                with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO strings_cache (binary_hash, address, value)
+                        VALUES (?, ?, ?)
+                        """,
+                        [(binary_hash, address, value) for address, value in items],
+                    )
+                    conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Cache put_strings failed: {e}")
+            return False
+
+    def search_strings(
+        self, binary_hash: str, query: str, limit: int = 100
+    ) -> list[tuple[str, str]]:
+        """Substring-search cached strings for a binary.
+
+        Args:
+            binary_hash: Hash of the binary.
+            query: Substring to match (case-sensitive, literal).
+            limit: Maximum number of results.
+
+        Returns:
+            List of (address, value) pairs whose value contains ``query``.
+        """
+        if not self.enabled:
+            return []
+        try:
+            # Escape LIKE wildcards so the query is treated literally.
+            escaped = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            with self._lock:
+                with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                    cursor = conn.execute(
+                        """
+                        SELECT address, value FROM strings_cache
+                        WHERE binary_hash = ? AND value LIKE ? ESCAPE '\\'
+                        LIMIT ?
+                        """,
+                        (binary_hash, pattern, limit),
+                    )
+                    return [(row[0], row[1]) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Cache search_strings failed: {e}")
+            return []
 
 
 def compute_binary_hash(binary_path: Path) -> str:
