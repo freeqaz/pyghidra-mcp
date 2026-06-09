@@ -564,17 +564,28 @@ class GuiPyGhidraContext(IndexingMixin):
         except ValueError:
             pass
 
+        # Force the correct processor for inputs Ghidra would otherwise
+        # mis-detect (a 32-bit BE PowerPC ELF/.o auto-detects to the 64-bit
+        # Xenon spec — see PyGhidraContext.detect_language_for_binary). The id
+        # is validated before it reaches the native loader.
+        detected_language = PyGhidraContext.detect_language_for_binary(binary_path)
+
         load_results = None
         try:
-            load_results = (
+            builder = (
                 ProgramLoader.builder()
                 .source(File(str(binary_path.absolute())))
                 .project(self.project)
                 .projectFolderPath(folder_path)
                 .name(program_name)
                 .monitor(TaskMonitor.DUMMY)
-                .load()
             )
+            if detected_language:
+                lang = PyGhidraContext._resolve_language(detected_language)
+                builder = builder.language(str(lang.getLanguageID())).compiler(
+                    str(lang.getDefaultCompilerSpec().getCompilerSpecID())
+                )
+            load_results = builder.load()
             loaded_program = load_results.getPrimaryDomainObject()
             self._mark_program_not_to_ask_to_analyze(loaded_program)
             domain_file = load_results.getPrimary().save(TaskMonitor.DUMMY)

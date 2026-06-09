@@ -360,11 +360,10 @@ class PyGhidraContext(IndexingMixin):
             logger.info(f"Importing new program: {program_name}")
             if language:
                 logger.info(f"Using language: {language}")
-                from ghidra.program.model.lang import LanguageID
-                from ghidra.program.util import DefaultLanguageService
-
-                lang_service = DefaultLanguageService.getLanguageService()
-                lang = lang_service.getLanguage(LanguageID(language))
+                # Validate/normalize the id in Python first. A bad or ":default"
+                # form must raise a clear exception here rather than be handed to
+                # the native loader, which can segfault on a relocatable input.
+                lang = self._resolve_language(language)
                 compiler_spec = lang.getDefaultCompilerSpec()
                 imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
             else:
@@ -482,6 +481,12 @@ class PyGhidraContext(IndexingMixin):
     def _is_binary_file(self, path: Path) -> bool:
         return is_ghidra_importable(path) or self._is_xex2(path)
 
+    # Ghidra processor variant for GameCube/Wii (paired-single capable Gekko/
+    # Broadway). Used for Wii executables AND relocatable .o objects produced by
+    # CodeWarrior for the console.
+    _GEKKO_LANGUAGE = "PowerPC:BE:32:Gekko_Broadway"
+    _XENON_LANGUAGE = "PowerPC:BE:64:Xenon"
+
     @staticmethod
     def detect_language_for_binary(binary_path: Path) -> str | None:
         """
@@ -489,29 +494,110 @@ class PyGhidraContext(IndexingMixin):
 
         Returns a Ghidra language ID string (e.g., "PowerPC:BE:64:Xenon") if a
         specific language is needed, or None to let Ghidra auto-detect.
+
+        Why this exists: for a 32-bit big-endian PowerPC ELF, Ghidra's ELF
+        loader lists ``PowerPC:BE:64:Xenon`` (the Xbox 360 / 64-bit variant) as
+        its *first preferred* language, so auto-detection silently picks the
+        wrong 64-bit processor for a GameCube/Wii input. We must force
+        ``PowerPC:BE:32:Gekko_Broadway`` ourselves.
+
+        This covers both fully-linked Wii executables (entry point in MEM1) AND
+        relocatable CodeWarrior ``.o`` objects (``ET_REL``, ``e_entry == 0``):
+        the earlier entry-point-window check returned None for ``.o`` files,
+        which is exactly what fed them to the wrong-language auto-detect.
         """
         try:
             with binary_path.open("rb") as f:
                 header = f.read(4)
                 # XEX2 (Xbox 360) requires PowerPC:BE:64:Xenon language
                 if header.startswith(b"XEX2"):
-                    return "PowerPC:BE:64:Xenon"
-                # 32-bit big-endian PowerPC ELF with an entry point in Wii MEM1
-                # (0x80000000..0x90000000) is a GameCube/Wii binary and needs
-                # PowerPC:BE:32:Gekko_Broadway for paired-single decoding.
+                    return PyGhidraContext._XENON_LANGUAGE
+                # Big-endian PowerPC ELF — disambiguate Wii (Gekko) from Xenon
+                # so we never let auto-detect fall into the 64-bit Xenon spec.
                 if header == b"\x7fELF":
                     f.seek(0)
                     e_ident = f.read(16)
-                    if e_ident[4] == 1 and e_ident[5] == 2:  # 32-bit big-endian
-                        f.seek(0x12)  # e_machine
-                        e_machine = int.from_bytes(f.read(2), "big")
+                    ei_class, ei_data = e_ident[4], e_ident[5]
+                    f.seek(0x10)  # e_type (Elf32 / Elf64 share this offset)
+                    e_type = int.from_bytes(f.read(2), "big")
+                    f.seek(0x12)  # e_machine
+                    e_machine = int.from_bytes(f.read(2), "big")
+                    is_be = ei_data == 2
+                    is_ppc = e_machine == 20  # EM_PPC (32-bit PowerPC)
+                    if is_be and is_ppc and ei_class == 1:  # 32-bit BE PPC
+                        # e_entry only meaningful for ET_EXEC(2)/ET_DYN(3).
+                        # ET_REL(1) objects have e_entry == 0 — treat any
+                        # 32-bit BE PPC ELF as Gekko (the only 32-bit BE PPC
+                        # target we ingest is the console).
                         f.seek(0x18)  # e_entry (Elf32)
                         e_entry = int.from_bytes(f.read(4), "big")
-                        if e_machine == 20 and 0x80000000 <= e_entry < 0x90000000:
-                            return "PowerPC:BE:32:Gekko_Broadway"
+                        if e_type == 1:  # ET_REL (.o) — no entry point
+                            return PyGhidraContext._GEKKO_LANGUAGE
+                        if 0x80000000 <= e_entry < 0x90000000:
+                            return PyGhidraContext._GEKKO_LANGUAGE
+                        # Any other 32-bit BE PPC ELF still wants Gekko over
+                        # the auto-detected 64-bit Xenon.
+                        return PyGhidraContext._GEKKO_LANGUAGE
         except Exception as e:
             logger.debug(f"Could not detect language for {binary_path}: {e}")
         return None
+
+    @staticmethod
+    def _resolve_language(language: str):
+        """Resolve a Ghidra language-id string to a Language, validating it.
+
+        Raises a *clear Python exception* (``ValueError``) for an unknown or
+        malformed language id — most importantly the ``:default`` forms
+        (``"PowerPC:BE:32:Gekko_Broadway:default"`` or a bare ``":default"``).
+        Those are *compiler-spec*-qualified strings, not language ids: feeding
+        one to the native loader has been observed to hard-crash (segfault) the
+        JVM rather than fail cleanly. We reject them up front in Python and, as
+        a convenience, strip a trailing ``:default`` compiler-spec suffix when
+        the remaining prefix is itself a valid language id.
+
+        Returns the resolved ``ghidra.program.model.lang.Language``.
+        """
+        from ghidra.program.model.lang import LanguageID, LanguageNotFoundException
+        from ghidra.program.util import DefaultLanguageService
+
+        lang_service = DefaultLanguageService.getLanguageService()
+
+        def _lookup(lang_id: str):
+            try:
+                return lang_service.getLanguage(LanguageID(lang_id))
+            except LanguageNotFoundException:
+                return None
+            except Exception:  # JPype may surface this as a generic JException
+                return None
+
+        if not language or not isinstance(language, str):
+            raise ValueError(f"Invalid Ghidra language id: {language!r}")
+
+        lang = _lookup(language)
+        if lang is not None:
+            return lang
+
+        # A 5-part "processor:endian:size:variant:compilerspec" string (e.g. the
+        # ":default" form Ghidra prints for a LanguageCompilerSpecPair) is NOT a
+        # valid LanguageID. If trimming the trailing compiler-spec field yields a
+        # real language, accept it; otherwise fail loudly (never let it reach the
+        # native loader, which can segfault on a bad/relocatable input).
+        parts = language.split(":")
+        if len(parts) == 5:
+            trimmed = ":".join(parts[:4])
+            lang = _lookup(trimmed)
+            if lang is not None:
+                logger.warning(
+                    "Stripped compiler-spec suffix %r -> language %r", language, trimmed
+                )
+                return lang
+
+        raise ValueError(
+            f"Unknown or malformed Ghidra language id: {language!r}. "
+            "Expected a 4-part 'processor:endian:size:variant' id such as "
+            f"{PyGhidraContext._GEKKO_LANGUAGE!r} (note: a 5-part ':default' "
+            "form is a compiler-spec pair, not a language id)."
+        )
 
     def _import_callback(self, future: concurrent.futures.Future):
         """
