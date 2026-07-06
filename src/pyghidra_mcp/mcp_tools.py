@@ -14,6 +14,7 @@ from mcp.server.fastmcp import Context
 from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, INVALID_PARAMS, ErrorData
 
+from pyghidra_mcp._locking import GHIDRA_GLOBAL_LOCK
 from pyghidra_mcp.context_protocol import MCPContext
 from pyghidra_mcp.models import (
     BytesReadResult,
@@ -215,6 +216,23 @@ def search_code(
     """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
+    # Distinguish "code index was SKIPPED for this server" from "index still
+    # building". Under --skip-code-collection the code_collection is None and
+    # will NEVER be built, so the generic "try again later" message is
+    # misleading. Give an accurate, actionable error instead. (When code
+    # collection is enabled, tools.search_code still raises the truthful
+    # "indexing is not complete ... try again later" message.)
+    if getattr(program_info, "code_collection", None) is None and getattr(
+        pyghidra_context, "skip_code_collection", False
+    ):
+        raise ValueError(
+            "Code search is unavailable: this server was started with "
+            "--skip-code-collection, so the semantic/literal code index was "
+            "never built for this binary and never will be during this "
+            "session. Use search_strings for text/data references and "
+            "list_xrefs (plus decompile_function) to trace code, or restart "
+            "the server without --skip-code-collection to enable code search."
+        )
     tools = _make_tools(pyghidra_context, program_info)
     return tools.search_code(
         query=query,
@@ -661,8 +679,9 @@ def create_structures(
 ) -> dict:
     """Create structure data types in Ghidra's Data Type Manager.
 
-    Seeds the DTM with structure definitions from DC3 headers, enabling the
-    decompiler to use these types for type propagation and member inference.
+    Seeds the DTM with the provided struct definitions (e.g. transcribed from
+    headers or a symbol source), enabling the decompiler to use these types for
+    type propagation and member inference.
 
     Args:
         binary_name: The name of the binary to operate on.
@@ -675,8 +694,11 @@ def create_structures(
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = _make_tools(pyghidra_context, program_info)
     result = tools.create_structures(class_defs)
-    # Persist to disk so structs survive restarts
-    pyghidra_context.project.save(program_info.program)
+    # Persist to disk so structs survive restarts. project.save touches the
+    # shared Ghidra program DB, so serialize it through the same global lock
+    # the GhidraTools methods use (create_structures already ran under it).
+    with GHIDRA_GLOBAL_LOCK:
+        pyghidra_context.project.save(program_info.program)
     return result
 
 
@@ -711,7 +733,8 @@ def bulk_create_functions(
 ) -> dict:
     """Create Function objects at addresses where Ghidra auto-analysis missed them.
 
-    Many map file addresses have code but no Ghidra function object. This bulk-creates
+    Given addresses (e.g. from a symbol/map source, an .exidx table, or manual
+    triage) that hold code but have no Ghidra function object, this bulk-creates
     functions so they can be decompiled and have signatures applied.
 
     Args:
@@ -722,7 +745,9 @@ def bulk_create_functions(
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = _make_tools(pyghidra_context, program_info)
     result = tools.bulk_create_functions(addresses)
-    pyghidra_context.project.save(program_info.program)
+    # Serialize the shared-program-DB save through the global Ghidra lock.
+    with GHIDRA_GLOBAL_LOCK:
+        pyghidra_context.project.save(program_info.program)
     return result
 
 
@@ -732,21 +757,28 @@ def apply_demangled_signatures(
     symbols: list[dict],
     ctx: Context,
 ) -> dict:
-    """Apply full function signatures by demangling MSVC mangled names.
+    """Apply full function signatures by demangling MSVC-mangled names.
 
-    Uses Ghidra's MicrosoftDemangler to parse mangled names into complete function
-    signatures (calling convention, return type, all parameter types) and applies them.
-    This is far more powerful than apply_this_types as it sets ALL parameters, not just this*.
+    MSVC-ONLY: uses Ghidra's MicrosoftDemangler to parse Microsoft Visual C++
+    mangled names ("?name@Class@@...") into complete function signatures (calling
+    convention, return type, all parameter types) and applies them. More powerful
+    than apply_this_types as it sets ALL parameters, not just this*.
+
+    Not applicable to targets without MSVC mangling (e.g. a stripped GCC/ARM ELF,
+    which has no mangled symbols at all, or Itanium/GCC-mangled C++). For those,
+    use set_function_prototype to set signatures explicitly.
 
     Args:
         binary_name: The name of the binary to operate on.
         symbols: List of dicts, each with:
-            - "mangled": MSVC mangled name (e.g., "?Load@CharBonesSamples@@QAAXAAVBinStream@@@Z")
-            - "address": hex address without 0x prefix (e.g., "823486e0")
+            - "mangled": MSVC mangled name (e.g., "?Load@Class@@QAAXAAVStream@@@Z")
+            - "address": hex address without 0x prefix (e.g., "00401a20")
     """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = _make_tools(pyghidra_context, program_info)
     result = tools.apply_demangled_signatures(symbols)
-    pyghidra_context.project.save(program_info.program)
+    # Serialize the shared-program-DB save through the global Ghidra lock.
+    with GHIDRA_GLOBAL_LOCK:
+        pyghidra_context.project.save(program_info.program)
     return result

@@ -32,6 +32,7 @@ from pyghidra_mcp.models import (
     SwitchInfo,
     SymbolInfo,
 )
+from pyghidra_mcp._locking import serialize_ghidra_methods
 from pyghidra_mcp.symbol_lookup import (
     SymbolMatcher,
     MapFileParser,
@@ -234,8 +235,18 @@ def handle_exceptions(func):
     return wrapper
 
 
+@serialize_ghidra_methods
 class GhidraTools:
-    """Comprehensive tool handler for Ghidra MCP tools"""
+    """Comprehensive tool handler for Ghidra MCP tools.
+
+    Every public method is serialized through the process-wide
+    ``GHIDRA_GLOBAL_LOCK`` (see :mod:`pyghidra_mcp._locking`) so that concurrent
+    MCP clients queue and succeed instead of racing the single JVM into a
+    deadlock. The lock is reentrant, so public methods that call other public
+    methods (e.g. ``decompile_function_by_name_or_addr`` -> ``find_function``)
+    do not self-deadlock. It is taken per operation, not per batch, so a
+    multi-target ``decompile_function`` interleaves fairly with other clients.
+    """
 
     def __init__(
         self,

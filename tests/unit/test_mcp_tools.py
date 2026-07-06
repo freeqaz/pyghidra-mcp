@@ -310,3 +310,65 @@ def test_goto_uses_gui_context():
     assert response.binary_name == "sample"
     assert response.address == "1000042e3"
     assert response.success is True
+
+
+def test_search_code_skipped_gives_accurate_error(monkeypatch):
+    # Under --skip-code-collection the code index is never built. search_code
+    # must return an accurate, actionable error (not the misleading generic
+    # "try again later"), without ever constructing GhidraTools.
+    from mcp.shared.exceptions import McpError
+
+    from pyghidra_mcp.mcp_tools import search_code
+
+    program_info = Mock()
+    program_info.code_collection = None
+
+    pyghidra_context = Mock()
+    pyghidra_context.skip_code_collection = True
+    pyghidra_context.get_program_info.return_value = program_info
+
+    monkeypatch.setattr(
+        "pyghidra_mcp.mcp_tools.GhidraTools",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("GhidraTools must not be built when code index is skipped")
+        ),
+    )
+
+    ctx = Mock()
+    ctx.request_context.lifespan_context = pyghidra_context
+
+    with pytest.raises(McpError) as excinfo:
+        search_code(binary_name="sample", query="foo", ctx=ctx)
+
+    msg = str(excinfo.value)
+    assert "--skip-code-collection" in msg
+    assert "search_strings" in msg
+
+
+def test_search_code_still_indexing_defers_to_tools(monkeypatch):
+    # When code collection is NOT skipped (e.g. RB3 with indexing enabled) the
+    # tool defers to GhidraTools.search_code, which owns the "still indexing"
+    # message. Confirm we do not short-circuit that path.
+    from pyghidra_mcp.mcp_tools import search_code
+
+    program_info = Mock()
+    program_info.code_collection = None
+
+    pyghidra_context = Mock()
+    pyghidra_context.skip_code_collection = False
+    pyghidra_context.get_program_info.return_value = program_info
+
+    fake_tools = Mock()
+    sentinel = object()
+    fake_tools.search_code.return_value = sentinel
+
+    monkeypatch.setattr(
+        "pyghidra_mcp.mcp_tools.GhidraTools", lambda *_a, **_k: fake_tools
+    )
+
+    ctx = Mock()
+    ctx.request_context.lifespan_context = pyghidra_context
+
+    result = search_code(binary_name="sample", query="foo", ctx=ctx)
+    assert result is sentinel
+    fake_tools.search_code.assert_called_once()
