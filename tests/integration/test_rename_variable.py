@@ -98,15 +98,24 @@ int main(void) {
     os.unlink(bin_file)
 
 
-@pytest.fixture(scope="module")
-def variable_server_params(variable_test_binary, ghidra_env, isolated_project_root):
+@pytest.fixture
+def variable_server_params(variable_test_binary, ghidra_env, isolated_project_root, request):
+    # Function-scoped on purpose: each test spawns its own server subprocess but
+    # they must NOT share an on-disk Ghidra project. These tests mutate
+    # function_one's `count` parameter (rename -> item_count, retype int -> long)
+    # and the writes are persisted to the project (analysis-persist + project.save).
+    # A shared project let test_rename_variable_tool's mutations leak into the
+    # later set_variable_type / set_function_prototype tests, which assume a
+    # pristine `int count`. Giving every test its own project directory restores
+    # the isolation each test already assumes.
+    project_dir = isolated_project_root / f"variable_server_params_{request.node.name}"
     return StdioServerParameters(
         command=sys.executable,
         args=[
             "-m",
             "pyghidra_mcp",
             "--project-path",
-            str(isolated_project_root / "variable_server_params"),
+            str(project_dir),
             "--project-name",
             "variable_server_params_project",
             "--wait-for-analysis",
