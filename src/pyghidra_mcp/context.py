@@ -315,6 +315,7 @@ class PyGhidraContext(IndexingMixin):
         analyze: bool = False,
         relative_path: Path | None = None,
         language: str | None = None,
+        base_addr: int | str | None = None,
     ) -> str | list[str]:
         """
         Imports a single binary into the project.
@@ -325,6 +326,15 @@ class PyGhidraContext(IndexingMixin):
             relative_path: Relative path within the project hierarchy (Path("bin") or Path("lib")).
             language: Optional Ghidra language ID (e.g., "PowerPC:BE:64:Xenon" for Xbox 360).
                       If None, Ghidra auto-detects the language from the binary format.
+            base_addr: Optional load/image base for a *flat* BinaryLoader import,
+                      as an int VA or a hex/decimal string ("0x91C60000"). Needed
+                      for relocated Xbox 360 modules whose runtime VA differs from
+                      the PE-header ImageBase (e.g. rb3el, relocated to 0x91C60000
+                      despite a PE ImageBase of 0x98000000). When None and the
+                      file is auto-detected as an Xbox 360 PPC PE (COFF machine
+                      0x01F2), it defaults to that PE's own ImageBase, so an
+                      uncompressed basefile lands at its natural VA (0x82000000)
+                      automatically. Ignored (stays None) for every non-flat input.
 
         Returns:
             Imported program pathname.
@@ -335,9 +345,25 @@ class PyGhidraContext(IndexingMixin):
         if binary_path.is_dir():
             return self.import_binaries([binary_path], analyze=analyze)
 
+        if isinstance(base_addr, str):
+            base_addr = int(base_addr, 0)
+
         # Auto-detect language if not specified
         if language is None:
             language = self.detect_language_for_binary(binary_path)
+
+        # Flat-image base resolution. Only Xbox 360 PPC PEs (COFF machine 0x01F2)
+        # match here; every other input returns (False, None) and keeps
+        # base_addr == None, so the existing XEX2/ELF/DOL/raw paths are unchanged.
+        if base_addr is None:
+            ppc_pe, pe_image_base = PyGhidraContext._xbox360_pe_image_base(binary_path)
+            if ppc_pe:
+                base_addr = pe_image_base
+                logger.info(
+                    f"Xbox 360 PPC PE detected; defaulting flat base to its "
+                    f".text-aligned VA {base_addr:#x} (ImageBase + .text "
+                    f"file/RVA delta) for {binary_path.name}"
+                )
 
         program_name = PyGhidraContext._gen_unique_bin_name(binary_path)
 
@@ -365,7 +391,24 @@ class PyGhidraContext(IndexingMixin):
                 # the native loader, which can segfault on a relocatable input.
                 lang = self._resolve_language(language)
                 compiler_spec = lang.getDefaultCompilerSpec()
-                imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
+                if base_addr is not None:
+                    # Flat image (Xbox 360 basefile PE / raw dump). Force
+                    # BinaryLoader explicitly and relocate to the requested VA,
+                    # mirroring analyzeHeadless -loader BinaryLoader
+                    # -loader-baseAddr. We do NOT force BinaryLoader for the
+                    # base-less path, because XEX2 relies on the XEXLoaderWV
+                    # extension loader (also advertised as Xenon), not BinaryLoader.
+                    from ghidra.app.util.opinion import BinaryLoader
+
+                    logger.info(f"Flat BinaryLoader import at base {base_addr:#x}")
+                    imported_program = self.project.importProgram(
+                        binary_path, BinaryLoader, lang, compiler_spec
+                    )
+                    # BinaryLoader loads at base 0; relocate the single flat
+                    # block to base_addr so VAs match (file off X -> base+X).
+                    self._set_image_base(imported_program, base_addr)
+                else:
+                    imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
             else:
                 imported_program = self.project.importProgram(binary_path)
             program = imported_program
@@ -445,6 +488,7 @@ class PyGhidraContext(IndexingMixin):
         candidates: list[ImportCandidate],
         *,
         analyze: bool = False,
+        base_addr: int | str | None = None,
     ) -> list[str]:
         imported_programs: list[str] = []
         for candidate in candidates:
@@ -453,6 +497,7 @@ class PyGhidraContext(IndexingMixin):
                     candidate.path,
                     analyze=analyze,
                     relative_path=candidate.relative_path,
+                    base_addr=base_addr,
                 )
                 if isinstance(imported, list):
                     imported_programs.extend(imported)
@@ -538,9 +583,135 @@ class PyGhidraContext(IndexingMixin):
                         # Any other 32-bit BE PPC ELF still wants Gekko over
                         # the auto-detected 64-bit Xenon.
                         return PyGhidraContext._GEKKO_LANGUAGE
+                # Xbox 360 basefile PE — a PE32 image (``MZ`` at 0, ``PE\0\0``
+                # at e_lfanew) whose COFF machine type is 0x01F2
+                # (IMAGE_FILE_MACHINE_POWERPCBE). Stock Ghidra's PeLoader has
+                # *no opinion* for machine 0x01F2, so it declines and only the
+                # MSDOS/MZ loader claims the DOS stub — importing the file as
+                # x86:LE:16:Real Mode garbage (0 functions). Force the Xenon
+                # language so BinaryLoader (the only loader advertising Xenon
+                # that will claim this file) loads it as a flat PPC image.
+                # x86 PEs (machine 0x014c / 0x8664) never match 0x01F2, so this
+                # is a pure addition that leaves them — and every non-PPC-PE
+                # input — on their existing paths.
+                if header[:2] == b"MZ":
+                    ppc_pe, _image_base = PyGhidraContext._xbox360_pe_image_base(binary_path)
+                    if ppc_pe:
+                        return PyGhidraContext._XENON_LANGUAGE
         except Exception as e:
             logger.debug(f"Could not detect language for {binary_path}: {e}")
         return None
+
+    @staticmethod
+    def _xbox360_pe_image_base(binary_path: Path) -> "tuple[bool, int | None]":
+        """Return ``(is_xbox360_pe, flat_base)`` for an Xbox 360 basefile PE.
+
+        Xbox 360 basefiles (uncompressed XEX basefiles / decrypted modules) are
+        PE32 images — ``MZ`` at offset 0, ``PE\\0\\0`` at the little-endian dword
+        at 0x3C — whose COFF machine word (at e_lfanew+4) is 0x01F2,
+        ``IMAGE_FILE_MACHINE_POWERPCBE``. Stock Ghidra's PeLoader declines this
+        machine, so they must be imported through BinaryLoader as a flat image.
+
+        WHY THE RETURNED BASE IS NOT JUST ImageBase: a basefile PE is *not* a flat
+        memory image — each section has its own file-offset↔RVA delta, so
+        ``VA = file_off + (section.VirtualAddress - section.PointerToRawData)``.
+        A single flat BinaryLoader base can therefore only make ONE region's VAs
+        correct. Since we import for *code* RE, we align on ``.text``: we return
+
+            ImageBase + (.text.VirtualAddress - .text.PointerToRawData)
+
+        so ``.text`` bytes land at their true VA under a flat load. Concretely for
+        band_clean_tu5.exe: ImageBase 0x82000000, .text RVA 0x270000 at file
+        offset 0x264e00 (delta 0xb200) → flat base **0x8200b200** (verified: the
+        ``mflr r12`` prologues of real functions land exactly). Plain ImageBase
+        (0x82000000) would put every function 0xb200 off.
+
+        Sections with a *different* delta than ``.text`` (data, .idata, etc.) still
+        land at the wrong flat VA — unavoidable for a flat load and acceptable for
+        code analysis. RELOCATED modules (e.g. rb3el, runtime base 0x91C60800)
+        cannot be inferred from headers at all — their runtime base ≠ ImageBase —
+        and still require an explicit ``base_addr`` override.
+
+        If there is no ``.text`` section or its delta is 0, we fall back to plain
+        ImageBase (unchanged behavior). Anything that is not a machine-0x01F2 PE
+        returns ``(False, None)`` so x86 PEs, ELFs, DOLs and raw inputs are left
+        completely untouched. All reads are bounds-checked and any error yields
+        ``(False, None)`` — pure header-sniffing, never raises.
+        """
+        try:
+            size = binary_path.stat().st_size
+            with binary_path.open("rb") as f:
+                if f.read(2) != b"MZ":
+                    return (False, None)
+                f.seek(0x3C)
+                e_lfanew = int.from_bytes(f.read(4), "little")
+                # Need the PE signature (4) + COFF header (20) + at least the
+                # opt-header ImageBase (up through e_lfanew+0x38). The section
+                # table (validated below) needs SizeOfOptionalHeader too.
+                if e_lfanew <= 0 or e_lfanew + 0x38 > size:
+                    return (False, None)
+                f.seek(e_lfanew)
+                if f.read(4) != b"PE\x00\x00":
+                    return (False, None)
+                machine = int.from_bytes(f.read(2), "little")
+                if machine != 0x01F2:  # IMAGE_FILE_MACHINE_POWERPCBE
+                    return (False, None)
+                # COFF header (starts right after the 4-byte PE signature at
+                # e_lfanew): NumberOfSections @ e_lfanew+6, SizeOfOptionalHeader
+                # @ e_lfanew+0x14. The optional header follows the 20-byte COFF
+                # header at e_lfanew+0x18.
+                num_sections = int.from_bytes(f.read(2), "little")  # e_lfanew+6
+                f.seek(e_lfanew + 0x14)
+                size_opt_hdr = int.from_bytes(f.read(2), "little")
+                # PE32 optional header begins at e_lfanew+0x18; its 4-byte
+                # ImageBase field sits at +0x1c (PE32; PE32+ would be 8 bytes,
+                # but Xbox 360 basefiles are always PE32, magic 0x010b).
+                f.seek(e_lfanew + 0x18 + 0x1C)
+                image_base = int.from_bytes(f.read(4), "little")
+
+                # Section headers begin right after the optional header. Each is
+                # 40 bytes: Name[8], VirtualSize, VirtualAddress(RVA) @+12,
+                # SizeOfRawData @+16, PointerToRawData @+20. Align the flat base
+                # on .text so code lands at its true VA.
+                text_delta = 0
+                sect_start = e_lfanew + 0x18 + size_opt_hdr
+                sect_end = sect_start + num_sections * 40
+                if 0 < num_sections <= 96 and sect_end <= size:
+                    f.seek(sect_start)
+                    table = f.read(num_sections * 40)
+                    for i in range(num_sections):
+                        ent = table[i * 40 : i * 40 + 40]
+                        name = ent[:8].rstrip(b"\x00")
+                        if name == b".text":
+                            rva = int.from_bytes(ent[12:16], "little")
+                            ptr_raw = int.from_bytes(ent[20:24], "little")
+                            text_delta = rva - ptr_raw
+                            break
+                return (True, image_base + text_delta)
+        except Exception as e:
+            logger.debug(f"Could not read PE header for {binary_path}: {e}")
+            return (False, None)
+
+    @staticmethod
+    def _set_image_base(program, base_addr: int) -> None:
+        """Relocate a freshly BinaryLoader-imported flat image to ``base_addr``.
+
+        BinaryLoader always loads at base 0. ``Program.setImageBase(addr, True)``
+        shifts every memory block by ``(base_addr - oldBase)``; for a flat single
+        block loaded at 0 that lands the whole image at ``base_addr`` so file
+        offset X maps to VA ``base_addr + X`` — matching what analyzeHeadless
+        ``-loader BinaryLoader -loader-baseAddr`` produces (see import-hv.sh /
+        import-rb3el.sh). Must run inside a transaction on the program.
+        """
+        space = program.getAddressFactory().getDefaultAddressSpace()
+        addr = space.getAddress(int(base_addr))
+        txid = program.startTransaction("Set image base for flat PPC-PE import")
+        committed = False
+        try:
+            program.setImageBase(addr, True)
+            committed = True
+        finally:
+            program.endTransaction(txid, committed)
 
     @staticmethod
     def _resolve_language(language: str):
@@ -610,13 +781,21 @@ class PyGhidraContext(IndexingMixin):
             logger.error(f"FATAL ERROR during background binary import: {e}", exc_info=True)
             raise e
 
-    def import_binary_backgrounded(self, binary_path: str | Path) -> ImportRequestResult:
+    def import_binary_backgrounded(
+        self, binary_path: str | Path, base_addr: int | str | None = None
+    ) -> ImportRequestResult:
         """
         Spawns a thread and imports a binary into the project.
         When the binary is analyzed it will be added to the project.
 
         Args:
             binary_path: The path of the binary to import.
+            base_addr: Optional flat-image load base (int VA or hex/decimal
+                string) forwarded to import_binary — for relocated Xbox 360
+                modules like rb3el (0x91C60000). Applies to every candidate
+                queued from binary_path; intended for single-file imports.
+                Left None, Xbox 360 PPC PEs still auto-base off their PE
+                ImageBase (e.g. band_clean_tu5 -> 0x82000000).
         """
         if not Path(binary_path).exists():
             raise FileNotFoundError(f"The file {binary_path} cannot be found")
@@ -628,10 +807,11 @@ class PyGhidraContext(IndexingMixin):
                 self._import_candidates,
                 import_plan.candidates,
                 analyze=True,
+                base_addr=base_addr,
             )
             future.add_done_callback(self._import_callback)
         elif import_plan.candidates:
-            self._import_candidates(import_plan.candidates, analyze=True)
+            self._import_candidates(import_plan.candidates, analyze=True, base_addr=base_addr)
 
         queued_paths = [str(candidate.path) for candidate in import_plan.candidates]
         skipped = [
