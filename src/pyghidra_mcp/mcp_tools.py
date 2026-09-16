@@ -83,6 +83,20 @@ def _run_for_context(pyghidra_context: MCPContext, fn):
     return fn()
 
 
+def _persist_program(pyghidra_context: MCPContext, program_info) -> None:
+    """Flush an in-memory ProgramDB edit to the .gpr so it survives a crash.
+
+    rename/retype/prototype/comment commit only to the in-memory program
+    transaction; without this they reach disk only on a clean full-process
+    shutdown (the per-session save is disabled), so a JVM crash, OOM or kill
+    loses them. Mirrors the project.save() the struct/bulk write tools already
+    do (create_structures, bulk_create_functions, apply_demangled_signatures),
+    serialized through the same global lock the GhidraTools methods use.
+    """
+    with GHIDRA_GLOBAL_LOCK:
+        pyghidra_context.project.save(program_info.program)
+
+
 def _get_action_name(func_name: str) -> str:
     """Derives a gerund action name from a function name."""
     action = func_name.replace("_", " ")
@@ -318,6 +332,7 @@ def rename_function(
         lambda: tools.rename_function(name_or_address, new_name),
     )
     result = cast(dict, result)
+    _persist_program(pyghidra_context, program_info)
     return RenameResponse(binary_name=binary_name, **result)
 
 
@@ -338,6 +353,7 @@ def rename_variable(
         lambda: tools.rename_variable(function_name_or_address, variable_name, new_name),
     )
     result = cast(dict, result)
+    _persist_program(pyghidra_context, program_info)
     return VariableRenameResponse(binary_name=binary_name, **result)
 
 
@@ -358,6 +374,7 @@ def set_variable_type(
         lambda: tools.set_variable_type(function_name_or_address, variable_name, type_name),
     )
     result = cast(dict, result)
+    _persist_program(pyghidra_context, program_info)
     return VariableTypeResponse(binary_name=binary_name, **result)
 
 
@@ -377,6 +394,7 @@ def set_function_prototype(
         lambda: tools.set_function_prototype(function_name_or_address, prototype),
     )
     result = cast(dict, result)
+    _persist_program(pyghidra_context, program_info)
     return FunctionPrototypeResponse(binary_name=binary_name, **result)
 
 
@@ -397,6 +415,7 @@ def set_comment(
         lambda: tools.set_comment(target, comment, comment_type),
     )
     result = cast(dict, result)
+    _persist_program(pyghidra_context, program_info)
     return CommentResponse(binary_name=binary_name, **result)
 
 
