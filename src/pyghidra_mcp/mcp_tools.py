@@ -524,10 +524,21 @@ def gen_callgraph(
 
 
 @mcp_error_handler
-def import_binary(binary_path: str, ctx: Context) -> ImportRequestResult:
-    """Import a binary into the project from a file path."""
+def import_binary(
+    binary_path: str, ctx: Context, base_addr: str | int | None = None
+) -> ImportRequestResult:
+    """Import a binary into the project from a file path.
+
+    base_addr: optional flat-image load base for relocated Xbox 360 modules
+    whose runtime VA differs from the file's PE-header ImageBase — pass a hex
+    or decimal string ("0x91C60000") or an int. rb3el must be imported at
+    0x91C60000 (its PE ImageBase is 0x98000000). Leave unset for normal inputs;
+    Xbox 360 basefile PEs (COFF machine 0x01F2) still auto-detect as
+    PowerPC:BE:64:Xenon and default their base to their own PE ImageBase
+    (e.g. band_clean_tu5 -> 0x82000000).
+    """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
-    return pyghidra_context.import_binary_backgrounded(binary_path)
+    return pyghidra_context.import_binary_backgrounded(binary_path, base_addr=base_addr)
 
 
 # Fork-only tools (freeqaz/pyghidra-mcp)
