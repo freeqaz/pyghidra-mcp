@@ -752,7 +752,9 @@ def apply_this_types(
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = _make_tools(pyghidra_context, program_info)
-    return tools.apply_this_types(class_methods)
+    result = tools.apply_this_types(class_methods)
+    _persist_program(pyghidra_context, program_info)
+    return result
 
 
 @mcp_error_handler
