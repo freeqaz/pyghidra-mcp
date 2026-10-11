@@ -756,6 +756,15 @@ class PyGhidraContext(IndexingMixin):
             program = results.getPrimary().getDomainObject()
             if program.getImageBase().getOffset() != 0:
                 raise ImportError("ELF loader did not honor image base zero")
+            # Builder.name controls the DomainFile name; the ELF loader still
+            # uses the source basename as Program.name. Index keys use the latter.
+            txid = program.startTransaction("Set content-hash program name")
+            committed = False
+            try:
+                program.setName(name)
+                committed = True
+            finally:
+                program.endTransaction(txid, committed)
             results.getPrimary().save(TaskMonitor.DUMMY)
         finally:
             results.close()

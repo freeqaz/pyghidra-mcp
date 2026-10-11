@@ -589,6 +589,13 @@ class GuiPyGhidraContext(IndexingMixin):
                 )
             load_results = builder.load()
             loaded_program = load_results.getPrimaryDomainObject()
+            txid = loaded_program.startTransaction("Set content-hash program name")
+            committed = False
+            try:
+                loaded_program.setName(program_name)
+                committed = True
+            finally:
+                loaded_program.endTransaction(txid, committed)
             self._mark_program_not_to_ask_to_analyze(loaded_program)
             domain_file = load_results.getPrimary().save(TaskMonitor.DUMMY)
         finally:
