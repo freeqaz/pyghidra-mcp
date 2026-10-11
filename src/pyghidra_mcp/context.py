@@ -384,39 +384,42 @@ class PyGhidraContext(IndexingMixin):
             program_info = self.programs[full_path]
         else:
             logger.info(f"Importing new program: {program_name}")
-            if language:
-                logger.info(f"Using language: {language}")
-                # Validate/normalize the id in Python first. A bad or ":default"
-                # form must raise a clear exception here rather than be handed to
-                # the native loader, which can segfault on a relocatable input.
-                lang = self._resolve_language(language)
-                compiler_spec = lang.getDefaultCompilerSpec()
-                if base_addr is not None:
-                    # Flat image (Xbox 360 basefile PE / raw dump). Force
-                    # BinaryLoader explicitly and relocate to the requested VA,
-                    # mirroring analyzeHeadless -loader BinaryLoader
-                    # -loader-baseAddr. We do NOT force BinaryLoader for the
-                    # base-less path, because XEX2 relies on the XEXLoaderWV
-                    # extension loader (also advertised as Xenon), not BinaryLoader.
-                    from ghidra.app.util.opinion import BinaryLoader
-
-                    logger.info(f"Flat BinaryLoader import at base {base_addr:#x}")
-                    imported_program = self.project.importProgram(
-                        binary_path, BinaryLoader, lang, compiler_spec
-                    )
-                    # BinaryLoader loads at base 0; relocate the single flat
-                    # block to base_addr so VAs match (file off X -> base+X).
-                    self._set_image_base(imported_program, base_addr)
-                else:
-                    imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
+            if base_addr is None and self._is_zero_based_elf(binary_path):
+                program = self._import_zero_based_elf(binary_path, ghidra_folder, program_name, language)
             else:
-                imported_program = self.project.importProgram(binary_path)
-            program = imported_program
-            program.name = program_name
-            if program:
-                self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
-                self.project.close(imported_program)
-                program = self.project.openProgram(ghidra_folder.pathname, program_name, False)
+                if language:
+                    logger.info(f"Using language: {language}")
+                    # Validate/normalize the id in Python first. A bad or ":default"
+                    # form must raise a clear exception here rather than be handed to
+                    # the native loader, which can segfault on a relocatable input.
+                    lang = self._resolve_language(language)
+                    compiler_spec = lang.getDefaultCompilerSpec()
+                    if base_addr is not None:
+                        # Flat image (Xbox 360 basefile PE / raw dump). Force
+                        # BinaryLoader explicitly and relocate to the requested VA,
+                        # mirroring analyzeHeadless -loader BinaryLoader
+                        # -loader-baseAddr. We do NOT force BinaryLoader for the
+                        # base-less path, because XEX2 relies on the XEXLoaderWV
+                        # extension loader (also advertised as Xenon), not BinaryLoader.
+                        from ghidra.app.util.opinion import BinaryLoader
+
+                        logger.info(f"Flat BinaryLoader import at base {base_addr:#x}")
+                        imported_program = self.project.importProgram(
+                            binary_path, BinaryLoader, lang, compiler_spec
+                        )
+                        # BinaryLoader loads at base 0; relocate the single flat
+                        # block to base_addr so VAs match (file off X -> base+X).
+                        self._set_image_base(imported_program, base_addr)
+                    else:
+                        imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
+                else:
+                    imported_program = self.project.importProgram(binary_path)
+                program = imported_program
+                program.name = program_name
+                if program:
+                    self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
+                    self.project.close(imported_program)
+                    program = self.project.openProgram(ghidra_folder.pathname, program_name, False)
 
             program_info = self._init_program_info(program)
             self.programs[program.getDomainFile().pathname] = program_info
@@ -691,6 +694,72 @@ class PyGhidraContext(IndexingMixin):
         except Exception as e:
             logger.debug(f"Could not read PE header for {binary_path}: {e}")
             return (False, None)
+
+    @staticmethod
+    def _is_zero_based_elf(binary_path: Path) -> bool:
+        """Detect base-zero ET_DYN/ET_EXEC from ELF program headers, not Ghidra.
+
+        Supports ELF32/ELF64 and either byte order. ET_REL and malformed or
+        extended program-header layouts are left to the normal importer.
+        """
+        import struct
+
+        try:
+            with Path(binary_path).open("rb") as stream:
+                header = stream.read(64)
+                if len(header) < 52 or header[:4] != b"\x7fELF" or header[4] not in (1, 2) or header[5] not in (1, 2):
+                    return False
+                order = "<" if header[5] == 1 else ">"
+                if struct.unpack_from(order + "H", header, 16)[0] not in (2, 3):
+                    return False
+                bits64 = header[4] == 2
+                if bits64 and len(header) < 64:
+                    return False
+                phoff = struct.unpack_from(order + ("Q" if bits64 else "I"), header, 32 if bits64 else 28)[0]
+                entsize, count = struct.unpack_from(order + "HH", header, 54 if bits64 else 42)
+                minimum = 56 if bits64 else 32
+                if not phoff or entsize < minimum or count == 0xffff:
+                    return False
+                for i in range(count):
+                    stream.seek(phoff + i * entsize)
+                    entry = stream.read(minimum)
+                    if len(entry) != minimum:
+                        return False
+                    if struct.unpack_from(order + "I", entry)[0] == 1:  # PT_LOAD
+                        vaddr = struct.unpack_from(order + ("Q" if bits64 else "I"), entry, 16 if bits64 else 8)[0]
+                        if vaddr == 0:
+                            return True
+        except (OSError, struct.error):
+            return False
+        return False
+
+    def _import_zero_based_elf(self, path, folder, name, language):
+        """Choose base zero BEFORE ELF relocation processing; then save by hash.
+
+        setImageBase after import is insufficient: it leaves relocation bytes
+        based at Ghidra's substituted base. Existing projects are never migrated
+        implicitly; their address-bearing caches also require invalidation.
+        """
+        from ghidra.app.util.importer import ProgramLoader
+        from ghidra.util.task import TaskMonitor
+        from java.io import File
+
+        builder = (ProgramLoader.builder().source(File(str(path.absolute())))
+                   .project(self.project.getProject()).projectFolderPath(folder.pathname)
+                   .name(name).addLoaderArg("-loader-imagebase", "0")
+                   .monitor(TaskMonitor.DUMMY))
+        if language:
+            lang = self._resolve_language(language)
+            builder = builder.language(lang).compiler(lang.getDefaultCompilerSpec())
+        results = builder.load()
+        try:
+            program = results.getPrimary().getDomainObject()
+            if program.getImageBase().getOffset() != 0:
+                raise ImportError("ELF loader did not honor image base zero")
+            results.getPrimary().save(TaskMonitor.DUMMY)
+        finally:
+            results.close()
+        return self.project.openProgram(folder.pathname, name, False)
 
     @staticmethod
     def _set_image_base(program, base_addr: int) -> None:

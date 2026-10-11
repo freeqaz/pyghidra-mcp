@@ -555,6 +555,14 @@ Per-item errors are returned inline (other targets still succeed):
 
 - `import_binary(binary_path: str)`: Imports a binary from a designated path into the current Ghidra project. If the path is a directory, it will recursively scan and import all supported binary files, preserving the directory structure within the Ghidra project.
 
+  Base-zero ELF executables/shared objects are imported with `-loader-imagebase 0`
+  by default in headless and GUI mode, so symbols and relocation values match
+  ELF virtual addresses. Nonzero-base ELF, ET_REL and explicit flat-image imports
+  retain their existing policy. Existing programs are opened unchanged: repair
+  them offline with a backup and invalidate code, string and decompilation caches.
+  Changing only `Program.setImageBase` after import leaves relocated pointer
+  bytes at the old base and is insufficient.
+
 - `list_project_binaries()`: Lists binaries in the current Ghidra project. In GUI mode this includes project binaries that exist on disk even if they are not currently open in CodeBrowser.
 
 - `list_project_binary_metadata(binary_name: str)`: Retrieves detailed metadata for a specific binary, including architecture, compiler, executable format, analysis metrics, and file hashes.

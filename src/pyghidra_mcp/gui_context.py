@@ -580,6 +580,8 @@ class GuiPyGhidraContext(IndexingMixin):
                 .name(program_name)
                 .monitor(TaskMonitor.DUMMY)
             )
+            if PyGhidraContext._is_zero_based_elf(binary_path):
+                builder = builder.addLoaderArg("-loader-imagebase", "0")
             if detected_language:
                 lang = PyGhidraContext._resolve_language(detected_language)
                 builder = builder.language(str(lang.getLanguageID())).compiler(
