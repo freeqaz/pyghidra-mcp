@@ -352,18 +352,8 @@ class PyGhidraContext(IndexingMixin):
         if language is None:
             language = self.detect_language_for_binary(binary_path)
 
-        # Flat-image base resolution. Only Xbox 360 PPC PEs (COFF machine 0x01F2)
-        # match here; every other input returns (False, None) and keeps
-        # base_addr == None, so the existing XEX2/ELF/DOL/raw paths are unchanged.
         if base_addr is None:
-            ppc_pe, pe_image_base = PyGhidraContext._xbox360_pe_image_base(binary_path)
-            if ppc_pe:
-                base_addr = pe_image_base
-                logger.info(
-                    f"Xbox 360 PPC PE detected; defaulting flat base to its "
-                    f".text-aligned VA {base_addr:#x} (ImageBase + .text "
-                    f"file/RVA delta) for {binary_path.name}"
-                )
+            base_addr = PyGhidraContext._default_flat_base(binary_path)
 
         program_name = PyGhidraContext._gen_unique_bin_name(binary_path)
 
@@ -385,41 +375,13 @@ class PyGhidraContext(IndexingMixin):
         else:
             logger.info(f"Importing new program: {program_name}")
             if base_addr is None and self._is_zero_based_elf(binary_path):
-                program = self._import_zero_based_elf(binary_path, ghidra_folder, program_name, language)
+                program = self._import_zero_based_elf(
+                    binary_path, ghidra_folder, program_name, language
+                )
             else:
-                if language:
-                    logger.info(f"Using language: {language}")
-                    # Validate/normalize the id in Python first. A bad or ":default"
-                    # form must raise a clear exception here rather than be handed to
-                    # the native loader, which can segfault on a relocatable input.
-                    lang = self._resolve_language(language)
-                    compiler_spec = lang.getDefaultCompilerSpec()
-                    if base_addr is not None:
-                        # Flat image (Xbox 360 basefile PE / raw dump). Force
-                        # BinaryLoader explicitly and relocate to the requested VA,
-                        # mirroring analyzeHeadless -loader BinaryLoader
-                        # -loader-baseAddr. We do NOT force BinaryLoader for the
-                        # base-less path, because XEX2 relies on the XEXLoaderWV
-                        # extension loader (also advertised as Xenon), not BinaryLoader.
-                        from ghidra.app.util.opinion import BinaryLoader
-
-                        logger.info(f"Flat BinaryLoader import at base {base_addr:#x}")
-                        imported_program = self.project.importProgram(
-                            binary_path, BinaryLoader, lang, compiler_spec
-                        )
-                        # BinaryLoader loads at base 0; relocate the single flat
-                        # block to base_addr so VAs match (file off X -> base+X).
-                        self._set_image_base(imported_program, base_addr)
-                    else:
-                        imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
-                else:
-                    imported_program = self.project.importProgram(binary_path)
-                program = imported_program
-                program.name = program_name
-                if program:
-                    self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
-                    self.project.close(imported_program)
-                    program = self.project.openProgram(ghidra_folder.pathname, program_name, False)
+                program = self._import_with_project_loader(
+                    binary_path, ghidra_folder, program_name, language, base_addr
+                )
 
             program_info = self._init_program_info(program)
             self.programs[program.getDomainFile().pathname] = program_info
@@ -433,6 +395,65 @@ class PyGhidraContext(IndexingMixin):
 
         logger.info(f"Program {program_name} is ready for use.")
         return str(program.getDomainFile().pathname)
+
+    @staticmethod
+    def _default_flat_base(binary_path: Path) -> int | None:
+        """Flat-image base resolution. Only Xbox 360 PPC PEs (COFF machine 0x01F2)
+        match here; every other input returns None, so the existing
+        XEX2/ELF/DOL/raw paths are unchanged."""
+        ppc_pe, pe_image_base = PyGhidraContext._xbox360_pe_image_base(binary_path)
+        if not ppc_pe:
+            return None
+        logger.info(
+            f"Xbox 360 PPC PE detected; defaulting flat base to its "
+            f".text-aligned VA {pe_image_base:#x} (ImageBase + .text "
+            f"file/RVA delta) for {binary_path.name}"
+        )
+        return pe_image_base
+
+    def _import_with_project_loader(
+        self,
+        binary_path: Path,
+        ghidra_folder,
+        program_name: str,
+        language: str | None,
+        base_addr: int | None,
+    ) -> "Program":
+        """Import via GhidraProject.importProgram, then save and reopen as program_name."""
+        if language:
+            logger.info(f"Using language: {language}")
+            # Validate/normalize the id in Python first. A bad or ":default"
+            # form must raise a clear exception here rather than be handed to
+            # the native loader, which can segfault on a relocatable input.
+            lang = self._resolve_language(language)
+            compiler_spec = lang.getDefaultCompilerSpec()
+            if base_addr is not None:
+                # Flat image (Xbox 360 basefile PE / raw dump). Force
+                # BinaryLoader explicitly and relocate to the requested VA,
+                # mirroring analyzeHeadless -loader BinaryLoader
+                # -loader-baseAddr. We do NOT force BinaryLoader for the
+                # base-less path, because XEX2 relies on the XEXLoaderWV
+                # extension loader (also advertised as Xenon), not BinaryLoader.
+                from ghidra.app.util.opinion import BinaryLoader
+
+                logger.info(f"Flat BinaryLoader import at base {base_addr:#x}")
+                imported_program = self.project.importProgram(
+                    binary_path, BinaryLoader, lang, compiler_spec
+                )
+                # BinaryLoader loads at base 0; relocate the single flat
+                # block to base_addr so VAs match (file off X -> base+X).
+                self._set_image_base(imported_program, base_addr)
+            else:
+                imported_program = self.project.importProgram(binary_path, lang, compiler_spec)
+        else:
+            imported_program = self.project.importProgram(binary_path)
+        program = imported_program
+        program.name = program_name
+        if program:
+            self.project.saveAs(program, ghidra_folder.pathname, program_name, True)
+            self.project.close(imported_program)
+            program = self.project.openProgram(ghidra_folder.pathname, program_name, False)
+        return program
 
     @staticmethod
     def _create_folder_hierarchy(root_folder, relative_path: Path):
@@ -707,7 +728,12 @@ class PyGhidraContext(IndexingMixin):
         try:
             with Path(binary_path).open("rb") as stream:
                 header = stream.read(64)
-                if len(header) < 52 or header[:4] != b"\x7fELF" or header[4] not in (1, 2) or header[5] not in (1, 2):
+                if (
+                    len(header) < 52
+                    or header[:4] != b"\x7fELF"
+                    or header[4] not in (1, 2)
+                    or header[5] not in (1, 2)
+                ):
                     return False
                 order = "<" if header[5] == 1 else ">"
                 if struct.unpack_from(order + "H", header, 16)[0] not in (2, 3):
@@ -715,10 +741,12 @@ class PyGhidraContext(IndexingMixin):
                 bits64 = header[4] == 2
                 if bits64 and len(header) < 64:
                     return False
-                phoff = struct.unpack_from(order + ("Q" if bits64 else "I"), header, 32 if bits64 else 28)[0]
+                phoff = struct.unpack_from(
+                    order + ("Q" if bits64 else "I"), header, 32 if bits64 else 28
+                )[0]
                 entsize, count = struct.unpack_from(order + "HH", header, 54 if bits64 else 42)
                 minimum = 56 if bits64 else 32
-                if not phoff or entsize < minimum or count == 0xffff:
+                if not phoff or entsize < minimum or count == 0xFFFF:
                     return False
                 for i in range(count):
                     stream.seek(phoff + i * entsize)
@@ -726,7 +754,9 @@ class PyGhidraContext(IndexingMixin):
                     if len(entry) != minimum:
                         return False
                     if struct.unpack_from(order + "I", entry)[0] == 1:  # PT_LOAD
-                        vaddr = struct.unpack_from(order + ("Q" if bits64 else "I"), entry, 16 if bits64 else 8)[0]
+                        vaddr = struct.unpack_from(
+                            order + ("Q" if bits64 else "I"), entry, 16 if bits64 else 8
+                        )[0]
                         if vaddr == 0:
                             return True
         except (OSError, struct.error):
@@ -744,10 +774,15 @@ class PyGhidraContext(IndexingMixin):
         from ghidra.util.task import TaskMonitor
         from java.io import File
 
-        builder = (ProgramLoader.builder().source(File(str(path.absolute())))
-                   .project(self.project.getProject()).projectFolderPath(folder.pathname)
-                   .name(name).addLoaderArg("-loader-imagebase", "0")
-                   .monitor(TaskMonitor.DUMMY))
+        builder = (
+            ProgramLoader.builder()
+            .source(File(str(path.absolute())))
+            .project(self.project.getProject())
+            .projectFolderPath(folder.pathname)
+            .name(name)
+            .addLoaderArg("-loader-imagebase", "0")
+            .monitor(TaskMonitor.DUMMY)
+        )
         if language:
             lang = self._resolve_language(language)
             builder = builder.language(lang).compiler(lang.getDefaultCompilerSpec())
@@ -836,9 +871,7 @@ class PyGhidraContext(IndexingMixin):
             trimmed = ":".join(parts[:4])
             lang = _lookup(trimmed)
             if lang is not None:
-                logger.warning(
-                    "Stripped compiler-spec suffix %r -> language %r", language, trimmed
-                )
+                logger.warning("Stripped compiler-spec suffix %r -> language %r", language, trimmed)
                 return lang
 
         raise ValueError(
