@@ -31,7 +31,7 @@ from pyghidra_mcp.models import (
 _IS_MACOS = platform.system() == "Darwin"
 _FUNC_PREFIX = "_" if _IS_MACOS else ""
 _MAIN_FUNC_NAME = "entry" if _IS_MACOS else "main"
-_BASE_ADDRESS = "100000000" if _IS_MACOS else "100000"
+_BASE_ADDRESS = "100000000" if _IS_MACOS else "0"
 
 
 def _find_free_port() -> int:
@@ -350,7 +350,7 @@ async def test_concurrent_streamable_client_invocations(streamable_server):
             assert bytes_result.address == "100000000"
         else:
             assert bytes_result.data == "7f454c46"  # ELF magic
-            assert bytes_result.address == "00100000"
+            assert bytes_result.address == "00000000"
 
         # Call graph
         call_graph_result = json.loads(client_responses[11].content[0].text)

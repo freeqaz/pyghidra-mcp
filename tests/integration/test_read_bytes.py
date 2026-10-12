@@ -35,5 +35,5 @@ async def test_read_bytes_tool(server_params, base_address, is_macos):
                 assert result.address == "100000000"
             else:
                 assert result.data == "7f454c46"  # 0x7F + "ELF" in hex
-                assert result.address == "00100000"
+                assert result.address == "00000000"
             assert result.size == 4

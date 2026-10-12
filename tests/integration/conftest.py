@@ -25,8 +25,11 @@ def main_func_name():
 
 @pytest.fixture(scope="session")
 def base_address():
-    """Return default base address for platform test binaries."""
-    return "100000000" if _IS_MACOS else "100000"
+    """Return default base address for platform test binaries.
+
+    Linux test binaries are base-zero PIE ELFs, which are imported at 0.
+    """
+    return "100000000" if _IS_MACOS else "0"
 
 
 @pytest.fixture(scope="session")
