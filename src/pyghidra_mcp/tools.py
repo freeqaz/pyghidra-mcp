@@ -221,6 +221,28 @@ def ghidra_transaction(program, description: str):
         program.endTransaction(tx_id, committed)
 
 
+class AmbiguousAddressError(ValueError):
+    """A bare address was given for a program that maps more than one memory space."""
+
+
+class AddressResolution(typing.NamedTuple):
+    """Outcome of interpreting query text as an address (see ``_resolve_address_text``).
+
+    ``address``: the parsed Ghidra Address, or None when the text is not an address.
+    ``qualified``: the text named its address space explicitly (``imem:00000a3b``).
+    ``refusal``: set instead of ``address`` when the text is address-shaped but cannot
+    be resolved without guessing (bare hex in a multi-space program, unknown space).
+    """
+
+    address: typing.Any
+    qualified: bool
+    refusal: Optional[str]
+
+
+_BARE_HEX_RE = re.compile(r"^(?:0[xX])?([0-9a-fA-F]+)$")
+_SPACE_QUALIFIED_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*):(?:0[xX])?([0-9a-fA-F]+)$")
+
+
 def handle_exceptions(func):
     """Decorator to handle exceptions in tool methods"""
 
@@ -278,12 +300,100 @@ class GhidraTools:
         max_path_len = 50
         return f"{func.getSymbol().getName(True)[:max_path_len]}-{func.entryPoint}"
 
+    def _loaded_memory_spaces(self) -> list[str]:
+        """Names of the distinct address spaces that hold loaded memory blocks.
+
+        Overlay spaces collapse onto their base space. A typical ELF/PE has one
+        (``ram``); a Falcon image has two (``imem`` and ``dmem``).
+        """
+        names: list[str] = []
+        for block in self.program.getMemory().getBlocks():
+            if not block.isLoaded():
+                continue
+            space = block.getStart().getAddressSpace()
+            physical = space.getPhysicalSpace()
+            if physical is not None:
+                space = physical
+            name = str(space.getName())
+            if name not in names:
+                names.append(name)
+        return names
+
+    def _resolve_address_text(self, text: str) -> AddressResolution:
+        """Interpret ``text`` as an address under the space policy.
+
+        - ``space:hex`` (``imem:00000a3b``, ``dmem:0x1558``) parses in that space.
+        - Bare hex (``00001558``, ``0x1558``) parses in the default space only when
+          the program maps a single memory space. When it maps more than one, a
+          bare address is refused, naming the space-qualified forms; Ghidra would
+          otherwise silently pick the default space (IMEM for Falcon).
+        - Anything else is not an address (``address`` and ``refusal`` both None),
+          so callers fall through to name lookup.
+
+        Never creates or modifies anything.
+        """
+        s = text.strip()
+        if not s:
+            return AddressResolution(None, False, None)
+        af = self.program.getAddressFactory()
+
+        if ":" in s:
+            qualified = _SPACE_QUALIFIED_RE.match(s)
+            # Strip a "0x" from the offset; pass other forms (overlay "a::b",
+            # segmented "1000:0010") to Ghidra untouched.
+            addr_text = f"{qualified.group(1)}:{qualified.group(2)}" if qualified else s
+            try:
+                addr = af.getAddress(addr_text)
+            except Exception:
+                addr = None
+            if addr is not None:
+                return AddressResolution(addr, True, None)
+            if qualified:
+                spaces = ", ".join(self._loaded_memory_spaces())
+                return AddressResolution(
+                    None,
+                    True,
+                    f"'{text}' is not a valid address: no space '{qualified.group(1)}' "
+                    f"or offset out of range (memory spaces: {spaces}).",
+                )
+            return AddressResolution(None, False, None)  # e.g. "Class::Method"
+
+        bare = _BARE_HEX_RE.match(s)
+        if not bare:
+            return AddressResolution(None, False, None)
+        offset = int(bare.group(1), 16)
+        spaces = self._loaded_memory_spaces()
+        if len(spaces) > 1:
+            width = max(8, len(bare.group(1)))
+            forms = ", ".join(f"{name}:{offset:0{width}x}" for name in spaces)
+            return AddressResolution(
+                None,
+                False,
+                f"Bare address '{text}' is ambiguous: this program maps "
+                f"{len(spaces)} address spaces ({', '.join(spaces)}). "
+                f"Use a space-qualified address: {forms}.",
+            )
+        try:
+            addr = af.getDefaultAddressSpace().getAddress(offset)
+        except Exception:
+            addr = None
+        return AddressResolution(addr, False, None)
+
+    def _function_at_or_containing(self, addr) -> Optional["Function"]:
+        fm = self.program.getFunctionManager()
+        func = fm.getFunctionAt(addr)
+        if func is None:
+            func = fm.getFunctionContaining(addr)
+        return func
+
     def _find_function_or_none(self, name_or_address: str) -> Optional["Function"]:
         """
         Find a function using multi-strategy lookup (fork extension). Returns None on miss.
 
         Tries in order:
-        1. Direct hex address (e.g., "0x82E4E6B8" or "82E4E6B8")
+        1. Direct address: "imem:00000a3b", or bare hex ("0x82E4E6B8") only in
+           single-space programs (see _resolve_address_text); the function at or
+           containing it
         2. Address lookup (from map file) - O(1) hash lookup
         3. Exact name match - O(n) iteration
         4. Demangled name match (Class::Method format)
@@ -298,48 +408,20 @@ class GhidraTools:
         """
         fm = self.program.getFunctionManager()
 
-        # Strategy 0: Direct hex address (e.g., "0x82E4E6B8" or "82E4E6B8")
-        raw_addr = None
-        stripped = name_or_address.strip().lower().replace("0x", "")
-        if stripped and all(c in "0123456789abcdef" for c in stripped):
-            try:
-                raw_addr = int(stripped, 16)
-            except ValueError:
-                pass
-        if raw_addr is not None:
-            addr_formats = [
-                f"0x{raw_addr:08x}",
-                f"ram:0x{raw_addr:08x}",
-            ]
-            found_raw_addr = None
-            for addr_str in addr_formats:
-                try:
-                    addr = self.program.getAddressFactory().getAddress(addr_str)
-                    if addr:
-                        found_raw_addr = addr
-                        func = fm.getFunctionAt(addr)
-                        if func:
-                            logger.debug(f"Found function by direct address: {name_or_address} -> {func.name}")
-                            return func
-                        func = fm.getFunctionContaining(addr)
-                        if func:
-                            logger.debug(f"Found function by direct address (containing): {name_or_address} -> {func.name}")
-                            return func
-                except Exception as e:
-                    logger.debug(f"Direct address lookup failed for {addr_str}: {e}")
-
-            # Strategy 0b: Try creating function at direct address if not found
-            if found_raw_addr:
-                try:
-                    from ghidra.app.cmd.function import CreateFunctionCmd
-                    cmd = CreateFunctionCmd(found_raw_addr)
-                    if cmd.applyTo(self.program):
-                        func = fm.getFunctionAt(found_raw_addr)
-                        if func:
-                            logger.info(f"Created function at 0x{raw_addr:08x} (direct address lookup)")
-                            return func
-                except Exception as e:
-                    logger.debug(f"Failed to create function at 0x{raw_addr:08x}: {e}")
+        # Strategy 0: direct address under the space policy (_resolve_address_text).
+        # Read-only: a miss is reported, never repaired with CreateFunctionCmd.
+        resolved = self._resolve_address_text(name_or_address)
+        if resolved.refusal is not None:
+            # Do not fall through to the fuzzy name strategies: a partial match on
+            # "00001558" would silently pick e.g. FUN_imem_00001558.
+            return None
+        if resolved.address is not None:
+            func = self._function_at_or_containing(resolved.address)
+            if func is not None:
+                logger.debug(f"Found function by direct address: {name_or_address} -> {func.name}")
+                return func
+            if resolved.qualified:
+                return None
 
         # Strategy 1: Address lookup from map file (O(1) - try first!)
         address = self.symbol_matcher.get_address(name_or_address)
@@ -357,7 +439,7 @@ class GhidraTools:
                 try:
                     addr = self.program.getAddressFactory().getAddress(addr_str)
                     if addr:
-                        found_addr = addr  # Save for later function creation
+                        found_addr = addr
                         # Try exact match first
                         func = fm.getFunctionAt(addr)
                         if func:
@@ -374,28 +456,11 @@ class GhidraTools:
                 except Exception as e:
                     logger.debug(f"Address lookup failed for {addr_str}: {e}")
 
-            # Strategy 1b: Try creating function at address if not found
-            # Some symbols exist in map file but Ghidra didn't create functions during analysis
+            # No CreateFunctionCmd here: lookups are read-only. A map symbol Ghidra
+            # never turned into a function is created explicitly with
+            # bulk_create_functions.
             if found_addr:
-                try:
-                    from ghidra.app.cmd.function import CreateFunctionCmd
-                    cmd = CreateFunctionCmd(found_addr)
-                    success = cmd.applyTo(self.program)
-                    if success:
-                        func = fm.getFunctionAt(found_addr)
-                        if func:
-                            logger.info(f"Created function at 0x{address:08x} for: {name_or_address}")
-                            return func
-                    else:
-                        # Check if address is inside another function (inlined/thunk)
-                        containing_func = fm.getFunctionContaining(found_addr)
-                        if containing_func:
-                            logger.warning(f"Address 0x{address:08x} is inside {containing_func.name} - "
-                                         "possibly inlined or a jump target")
-                        else:
-                            logger.debug(f"Failed to create function at 0x{address:08x}")
-                except Exception as e:
-                    logger.debug(f"Failed to create function at 0x{address:08x}: {e}")
+                logger.debug(f"No function at 0x{address:08x} for map symbol {name_or_address}")
         else:
             logger.debug(f"No address found in map file for: {name_or_address}")
 
@@ -542,18 +607,15 @@ class GhidraTools:
         Returns a flat list of unique Function objects.
         Search modes (exact, partial) are optional and only applied if enabled.
         """
-        af = self.program.getAddressFactory()
         fm = self.program.getFunctionManager()
 
-        # Try interpreting as an address first
-        try:
-            addr = af.getAddress(name_or_address)
-            if addr:
-                func = fm.getFunctionAt(addr)
-                if func:
-                    return [func]
-        except Exception:
-            pass  # Not an address, fall back to name search
+        # Try interpreting as an address first (space policy: a refused bare
+        # address in a multi-space program skips this step, leaving name search)
+        addr = self._resolve_address_text(name_or_address).address
+        if addr is not None:
+            func = fm.getFunctionAt(addr)
+            if func is not None:
+                return [func]
 
         name_lc = name_or_address.lower()
         functions = self.get_all_functions(include_externals=include_externals)
@@ -585,12 +647,28 @@ class GhidraTools:
         """
         Resolve a single function by name or address. Raises if ambiguous or not found.
 
-        First uses upstream's exact name/address resolver (which raises a helpful
+        An address resolves to the function at or containing it. A space-qualified
+        address ("imem:00000a3b") is final: a miss raises rather than falling back to
+        name matching. Bare hex in a program with more than one memory space (Falcon
+        imem/dmem) raises AmbiguousAddressError naming the qualified forms, unless it
+        is exactly some function's name.
+
+        Otherwise uses upstream's exact name resolver (which raises a helpful
         "Did you mean" error on ambiguity); if that finds nothing, falls back to the
         fork's multi-strategy resolver (map-file address lookup, MSVC demangle,
-        method/partial matching, and CreateFunctionCmd auto-creation for map symbols
-        Ghidra never turned into functions).
+        method/partial matching). Read-only: never creates functions.
         """
+        resolved = self._resolve_address_text(name_or_address)
+        if resolved.address is not None:
+            func = self._function_at_or_containing(resolved.address)
+            if func is not None:
+                return func
+            if resolved.qualified:
+                raise ValueError(
+                    f"No function at or containing {resolved.address} "
+                    f"(from '{name_or_address}')."
+                )
+
         matches = self._lookup_functions(
             name_or_address, exact=True, partial=False, include_externals=include_externals
         )
@@ -606,6 +684,8 @@ class GhidraTools:
                 f"Ambiguous match for '{name_or_address}'. Did you mean one of these: "
                 + ", ".join(suggestions)
             )
+        if resolved.refusal is not None:
+            raise AmbiguousAddressError(resolved.refusal)
 
         func = self._find_function_or_none(name_or_address)
         if func is not None:
@@ -640,17 +720,13 @@ class GhidraTools:
         Search modes (exact, partial, dynamic) are optional and only applied if enabled.
         """
         st = self.program.getSymbolTable()
-        af = self.program.getAddressFactory()
 
-        # Try interpreting as an address first
-        try:
-            addr = af.getAddress(name_or_address)
-            if addr:
-                addr_symbols = st.getSymbols(addr)
-                if addr_symbols:
-                    return list(addr_symbols)
-        except Exception:
-            pass  # Not an address, fall back to name search
+        # Try interpreting as an address first (same space policy as functions)
+        addr = self._resolve_address_text(name_or_address).address
+        if addr is not None:
+            addr_symbols = st.getSymbols(addr)
+            if addr_symbols:
+                return list(addr_symbols)
 
         name_lc = name_or_address.lower()
         matches: set[Symbol] = set()
@@ -698,6 +774,9 @@ class GhidraTools:
                 + ", ".join(suggestions)
             )
         else:
+            refusal = self._resolve_address_text(name_or_address).refusal
+            if refusal is not None:
+                raise AmbiguousAddressError(refusal)
             raise ValueError(f"Symbol '{name_or_address}' not found.")
 
     @handle_exceptions
@@ -1039,20 +1118,32 @@ class GhidraTools:
         """Finds and lists all cross-references (x-refs) to a given function, symbol,
         or address within a binary.
 
-        Uses multi-strategy lookup to find functions by:
-        - Direct address (hex string like "823486e0")
+        An address lists references to exactly that address. It must be
+        space-qualified ("dmem:00001558") in programs with more than one memory
+        space; bare hex ("823486e0") is accepted only in single-space programs.
+
+        Otherwise uses multi-strategy lookup to find functions by:
         - Exact name match
         - Address lookup from map file
         - Demangled name (Class::Method)
         - Method name only
         - Partial/substring match
         """
-        # Try parsing as direct address first
-        addr = None
-        try:
-            addr = self.program.getAddressFactory().getAddress(name_or_address)
-        except Exception:
-            pass
+        resolved = self._resolve_address_text(name_or_address)
+        addr = resolved.address
+
+        if addr is None and resolved.refusal is not None:
+            # Address-shaped but unresolvable: only an exact name may still match
+            # (a hex-looking name such as "add"); never the fuzzy strategies.
+            funcs = self._lookup_functions(name_or_address, exact=True, partial=False)
+            if len(funcs) == 1:
+                addr = funcs[0].getEntryPoint()
+            else:
+                syms = self._lookup_symbols(name_or_address, exact=True, partial=False)
+                if len(syms) == 1:
+                    addr = syms[0].getAddress()
+            if addr is None:
+                raise AmbiguousAddressError(resolved.refusal)
 
         # If not a valid address, use multi-strategy function lookup
         if addr is None:
@@ -1353,20 +1444,13 @@ class GhidraTools:
         if size > max_read_size:
             raise ValueError(f"Size {size} exceeds maximum {max_read_size}")
 
-        # Get address factory and parse address
-        af = self.program.getAddressFactory()
-
-        try:
-            # Handle common hex address formats
-            addr_str = address
-            if address.lower().startswith("0x"):
-                addr_str = address[2:]
-
-            addr = af.getAddress(addr_str)
-            if addr is None:
-                raise ValueError(f"Invalid address: {address}")
-        except Exception as e:
-            raise ValueError(f"Invalid address format '{address}': {e}") from e
+        # Parse address: "space:hex", or bare hex only in single-space programs
+        resolved = self._resolve_address_text(address)
+        if resolved.refusal is not None:
+            raise AmbiguousAddressError(resolved.refusal)
+        addr = resolved.address
+        if addr is None:
+            raise ValueError(f"Invalid address format '{address}'")
 
         # Check if address is in valid memory
         mem = self.program.getMemory()
@@ -2432,19 +2516,23 @@ class GhidraTools:
             logger.debug("Failed to invalidate decompiler cache", exc_info=True)
 
     def _parse_address(self, address: str):
-        addr_str = address[2:] if address.lower().startswith("0x") else address
-        addr = self.program.getAddressFactory().getAddress(addr_str)
-        if addr is None:
-            raise ValueError(f"Invalid address: {address}")
-        return addr
+        resolved = self._resolve_address_text(address)
+        if resolved.address is not None:
+            return resolved.address
+        if resolved.refusal is not None:
+            raise AmbiguousAddressError(resolved.refusal)
+        raise ValueError(f"Invalid address: {address}")
 
     def _resolve_comment_target_address(self, target: str):
+        ambiguous: Optional[AmbiguousAddressError] = None
         try:
             return self._parse_address(target)
+        except AmbiguousAddressError as e:
+            ambiguous = e  # do not guess a space; a name may still match exactly
         except Exception:
             pass
 
-        if target.isdigit():
+        if ambiguous is None and target.isdigit():
             addr = self.program.getAddressFactory().getDefaultAddressSpace().getAddress(int(target))
             if addr is not None:
                 return addr
@@ -2459,6 +2547,8 @@ class GhidraTools:
         except Exception:
             pass
 
+        if ambiguous is not None:
+            raise ambiguous
         raise ValueError(
             f"Could not resolve comment target '{target}' as an address, symbol, or function."
         )
