@@ -159,6 +159,9 @@ async def decompile_function(
     Accepts a single target or a list for batch decompilation.
     Rich response flags attach callees, strings, and/or xrefs to each result.
     `timeout_sec` applies per target.
+    An address inside a function resolves to the containing function.
+    Addresses: in a program with more than one memory space (Falcon imem/dmem)
+    use the space-qualified form (``imem:00000f8b``); bare hex is refused there.
     """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
@@ -474,6 +477,8 @@ def list_xrefs(
 
     Accepts a single target or a list for batch lookup.
     Suggests close matches on no exact hit.
+    Addresses: in a program with more than one memory space (Falcon imem/dmem)
+    use the space-qualified form (``imem:00000f8b``); bare hex is refused there.
     """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
@@ -506,7 +511,11 @@ def search_strings(
 
 @mcp_error_handler
 def read_bytes(binary_name: str, ctx: Context, address: str, size: int = 32) -> BytesReadResult:
-    """Read raw bytes at an address. Hex format supported (0x prefix optional)."""
+    """Read raw bytes at an address. Hex format supported (0x prefix optional).
+
+    Addresses: in a program with more than one memory space (Falcon imem/dmem)
+    use the space-qualified form (``imem:00000f8b``); bare hex is refused there.
+    """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = _make_tools(pyghidra_context, program_info)
